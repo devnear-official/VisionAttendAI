@@ -104,7 +104,7 @@ void showError(const char *message) {
 void setup() {
   Serial.begin(115200);
   SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
-  tft.begin();
+  tft.begin(40000000); // Fast 40MHz SPI to eliminate display jitter
   tft.setRotation(3); // 320 x 240 landscape (180 deg rotated)
   tft.fillScreen(ILI9341_BLACK);
   tft.setTextColor(ILI9341_CYAN);
@@ -204,7 +204,22 @@ void loop() {
   if (frame->format == PIXFORMAT_RGB565 && frame->width == 160 &&
       frame->height == 120 && frame->len >= 160U * 120U * 2U) {
 
-    // 1. Render camera frame to TFT (160x120 doubled to 320x240 landscape)
+    // 1. Execute Face Detection in memory FIRST (Display is NOT touched during inference)
+    std::list<dl::detect::result_t> results;
+    if (faceDetectorReady) {
+      dl::image::img_t img;
+      img.data = frame->buf;
+      img.width = 160;
+      img.height = 120;
+      img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
+
+      unsigned long t0 = millis();
+      results = faceDetector.detect(img);
+      lastInferTimeMs = millis() - t0;
+      detectedFaceCount = results.size();
+    }
+
+    // 2. Render camera frame to TFT (160x120 doubled to 320x240 landscape)
     static uint16_t row[320];
     uint8_t *out = reinterpret_cast<uint8_t *>(row);
     tft.startWrite();
@@ -220,64 +235,47 @@ void loop() {
     }
     tft.endWrite();
 
-    // 2. Execute Face Detection
-    std::list<dl::detect::result_t> results;
-    if (faceDetectorReady) {
-      dl::image::img_t img;
-      img.data = frame->buf;
-      img.width = 160;
-      img.height = 120;
-      img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
+    // 3. Immediately draw Bounding Boxes and Landmarks (zero delay after frame draw)
+    for (const auto &res : results) {
+      // Map 160x120 model coords to 320x240 display coords (x2 scaling)
+      int bx = res.box[0] * 2;
+      int by = res.box[1] * 2;
+      int bw = (res.box[2] - res.box[0]) * 2;
+      int bh = (res.box[3] - res.box[1]) * 2;
 
-      unsigned long t0 = millis();
-      results = faceDetector.detect(img);
-      lastInferTimeMs = millis() - t0;
-      detectedFaceCount = results.size();
-    }
+      if (bx < 0) bx = 0;
+      if (by < 0) by = 0;
+      if (bx + bw > 320) bw = 320 - bx;
+      if (by + bh > 240) bh = 240 - by;
 
-    // 3. Draw Bounding Boxes and Status Overlay on TFT
-    if (!results.empty()) {
-      for (const auto &res : results) {
-        // Map 160x120 model coords to 320x240 display coords (x2 scaling)
-        int bx = res.box[0] * 2;
-        int by = res.box[1] * 2;
-        int bw = (res.box[2] - res.box[0]) * 2;
-        int bh = (res.box[3] - res.box[1]) * 2;
-
-        if (bx < 0) bx = 0;
-        if (by < 0) by = 0;
-        if (bx + bw > 320) bw = 320 - bx;
-        if (by + bh > 240) bh = 240 - by;
-
-        // Draw 2-pixel thick green bounding box
-        tft.drawRect(bx, by, bw, bh, ILI9341_GREEN);
-        if (bw > 2 && bh > 2) {
-          tft.drawRect(bx + 1, by + 1, bw - 2, bh - 2, ILI9341_GREEN);
-        }
-
-        // Draw facial landmarks if detected by MNP stage
-        if (res.keypoint.size() >= 10) {
-          for (size_t kp = 0; kp < 10; kp += 2) {
-            int kpx = res.keypoint[kp] * 2;
-            int kpy = res.keypoint[kp + 1] * 2;
-            tft.fillCircle(kpx, kpy, 2, ILI9341_CYAN);
-          }
-        }
+      // Draw 2-pixel thick green bounding box
+      tft.drawRect(bx, by, bw, bh, ILI9341_GREEN);
+      if (bw > 2 && bh > 2) {
+        tft.drawRect(bx + 1, by + 1, bw - 2, bh - 2, ILI9341_GREEN);
       }
 
-      // Status header overlay
-      tft.fillRect(0, 0, 180, 16, ILI9341_BLACK);
-      tft.setCursor(4, 4);
-      tft.setTextColor(ILI9341_GREEN);
-      tft.setTextSize(1);
-      tft.printf("FACE DETECTED (%d) %ums", (int)results.size(), (unsigned)lastInferTimeMs);
-    } else {
-      tft.fillRect(0, 0, 140, 16, ILI9341_BLACK);
-      tft.setCursor(4, 4);
-      tft.setTextColor(ILI9341_YELLOW);
-      tft.setTextSize(1);
-      tft.printf("NO FACE %ums", (unsigned)lastInferTimeMs);
+      // Draw facial landmarks if detected by MNP stage
+      if (res.keypoint.size() >= 10) {
+        for (size_t kp = 0; kp < 10; kp += 2) {
+          int kpx = res.keypoint[kp] * 2;
+          int kpy = res.keypoint[kp + 1] * 2;
+          tft.fillCircle(kpx, kpy, 2, ILI9341_CYAN);
+        }
+      }
     }
+
+    // 4. Draw HUD status banner with background fill (anti-flicker, no fillRect clear needed)
+    char hudBuf[36];
+    if (!results.empty()) {
+      snprintf(hudBuf, sizeof(hudBuf), " FACE DETECTED (%d) %lums ", (int)results.size(), (unsigned long)lastInferTimeMs);
+      tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+    } else {
+      snprintf(hudBuf, sizeof(hudBuf), " NO FACE %lums       ", (unsigned long)lastInferTimeMs);
+      tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
+    }
+    tft.setTextSize(1);
+    tft.setCursor(4, 4);
+    tft.print(hudBuf);
 
     totalFramesRendered++;
     fpsFrameCount++;
