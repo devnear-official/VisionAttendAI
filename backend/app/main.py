@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import enrollment, health, recognition
+from app.api.routes import attendance, enrollment, health, recognition, students
 from app.core.config import get_settings
 from app.services.face_engine import face_engine
 from app.utils.logger import logger
@@ -68,6 +68,8 @@ async def global_exception_handler(request: Request, exc: Exception):
 app.include_router(health.router, prefix="/api/v1")
 app.include_router(enrollment.router, prefix="/api/v1")
 app.include_router(recognition.router, prefix="/api/v1")
+app.include_router(students.router, prefix="/api/v1")
+app.include_router(attendance.router, prefix="/api/v1")
 
 
 @app.get("/", include_in_schema=False)

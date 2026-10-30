@@ -1,11 +1,14 @@
-"""Pytest fixtures and test setup."""
+"""Pytest fixtures and test setup with isolated database transactions."""
 
 import sys
 from pathlib import Path
+from typing import Generator
 import cv2
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 # Ensure backend directory is in sys.path
 backend_dir = Path(__file__).resolve().parent.parent
@@ -13,16 +16,43 @@ if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
 from app.core.config import get_settings
+from app.database.session import SessionLocal, engine, get_db
 from app.main import app
 
 settings = get_settings()
 
 
-@pytest.fixture
-def client():
-    """FastAPI TestClient fixture."""
+@pytest.fixture(scope="function")
+def db_session() -> Generator[Session, None, None]:
+    """
+    Isolated database session fixture that wraps each test inside an uncommitted
+    transaction and rolls it back cleanly upon completion.
+    No test records are persisted to development or production tables.
+    """
+    connection = engine.connect()
+    transaction = connection.begin()
+    session = SessionLocal(bind=connection)
+
+    yield session
+
+    session.close()
+    transaction.rollback()
+    connection.close()
+
+
+@pytest.fixture(scope="function")
+def client(db_session: Session) -> Generator[TestClient, None, None]:
+    """FastAPI TestClient fixture with overridden database dependency."""
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as test_client:
         yield test_client
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -35,6 +65,15 @@ def admin_headers():
 def device_headers():
     """Headers for authorized edge device requests."""
     return {"X-Device-Api-Key": settings.DEVICE_API_KEY}
+
+
+@pytest.fixture
+def sample_normalized_embedding_512() -> np.ndarray:
+    """Generate a valid, normalized 512-D float32 embedding vector."""
+    np.random.seed(42)
+    vec = np.random.randn(512).astype(np.float32)
+    vec /= np.linalg.norm(vec)
+    return vec
 
 
 @pytest.fixture

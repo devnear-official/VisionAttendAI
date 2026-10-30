@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     # Project Info
     PROJECT_NAME: str = "VisionAttend-AI Backend"
-    PROJECT_VERSION: str = "0.5.1"
+    PROJECT_VERSION: str = "0.5.2"
     ENVIRONMENT: str = "development"
     DEBUG: bool = True
 
@@ -75,12 +75,18 @@ class Settings(BaseSettings):
     MIN_BRIGHTNESS: float = 25.0         # Underexposure threshold (0-255 scale)
     MAX_BRIGHTNESS: float = 235.0        # Overexposure threshold (0-255 scale)
 
-    # Database (Stage 5.2 placeholder)
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/visionattend"
+    # Database (PostgreSQL 17 + pgvector)
+    DATABASE_URL: str = "postgresql+psycopg://postgres:postgres@localhost:5432/visionattend"
     DATABASE_POOL_SIZE: int = 10
+    DATABASE_MAX_OVERFLOW: int = 5
+    DATABASE_POOL_TIMEOUT: int = 30
+    DATABASE_POOL_PRE_PING: bool = True
+
+    _backend_dir = Path(__file__).resolve().parent.parent.parent
+    _env_file_path = _backend_dir / ".env"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=_env_file_path if _env_file_path.exists() else ".env",
         env_file_encoding="utf-8",
         case_sensitive=True,
         extra="ignore"

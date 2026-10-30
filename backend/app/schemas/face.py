@@ -2,7 +2,7 @@
 
 from enum import Enum
 from typing import List, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 class MatchStatus(str, Enum):
@@ -38,10 +38,12 @@ class PersonResponse(BaseModel):
     person_id: str
     student_id: str
     full_name: str
-    department: str
-    batch: str
+    department: Optional[str] = None
+    batch: Optional[str] = None
+    status: str
     is_active: bool
     enrolled_at: str
+    embeddings_count: int = 0
 
 
 class EnrollmentResponse(BaseModel):
@@ -60,5 +62,8 @@ class RecognitionResponse(BaseModel):
     full_name: Optional[str] = None
     department: Optional[str] = None
     batch: Optional[str] = None
+    attendance_recorded: bool = False
+    already_checked_in: bool = False
+    attendance_id: Optional[str] = None
     inference_time_ms: float
     message: str

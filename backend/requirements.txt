@@ -1,12 +1,20 @@
-# VisionAttend-AI Backend Dependencies (Stage 5.1)
+# VisionAttend-AI Backend Dependencies (Stage 5.1 & 5.2)
 # Python 3.10+ / 3.11 recommended
 
 fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
 pydantic>=2.6.0
 pydantic-settings>=2.2.0
+email-validator>=2.1.0
 python-multipart>=0.0.9
 python-dotenv>=1.0.0
+
+# Database & Vector Extension
+sqlalchemy>=2.0.28
+psycopg[binary]>=3.1.18
+alembic>=1.13.1
+pgvector>=0.2.5
+bcrypt>=4.1.2
 
 # Numerical, Computer Vision & ONNX Runtime
 numpy>=1.26.0,<2.0.0
