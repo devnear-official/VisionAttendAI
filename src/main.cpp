@@ -148,6 +148,12 @@ void setup() {
   }
   cameraReady = true;
 
+  sensor_t *s = esp_camera_sensor_get();
+  if (s != nullptr) {
+    s->set_vflip(s, 1); // Flip vertically so heads are upright
+    Serial.println("Camera sensor vflip enabled (upright orientation)");
+  }
+
   tft.setCursor(8, 50);
   tft.setTextColor(ILI9341_YELLOW);
   tft.print("Loading Face Models...");
