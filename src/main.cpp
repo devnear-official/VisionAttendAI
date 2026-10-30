@@ -105,7 +105,7 @@ void setup() {
   Serial.begin(115200);
   SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
   tft.begin();
-  tft.setRotation(1); // 320 x 240 landscape
+  tft.setRotation(3); // 320 x 240 landscape (180 deg rotated)
   tft.fillScreen(ILI9341_BLACK);
   tft.setTextColor(ILI9341_CYAN);
   tft.setTextSize(2);
