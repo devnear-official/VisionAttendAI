@@ -1,0 +1,30 @@
+# Python virtual environment
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Large Model weights (DO NOT commit large weights to Git)
+models/*.onnx
+models/*.bin
+models/*.pt
+models/*.pth
+!models/README.md
+
+# Environment variables & secrets
+.env
+.env.local
+*.secret
+*.pem
+*.key
+
+# Temporary artifacts
+temp/
+logs/
+*.log
+.DS_Store
+Thumbs.db
