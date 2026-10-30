@@ -73,6 +73,10 @@ public:
     std::list<dl::detect::result_t> detect(const dl::image::img_t &img) {
         if (!m_initialized) return {};
 
+        // Always clear candidate lists from previous frame
+        m_msr_postprocessor->clear_result();
+        m_mnp_postprocessor->clear_result();
+
         // Stage 1: Candidate Proposal
         m_msr_preprocessor->preprocess(img);
         m_msr_model->run();
@@ -85,7 +89,6 @@ public:
         }
 
         // Stage 2: Candidate Refinement
-        m_mnp_postprocessor->clear_result();
         for (auto &candidate : candidates) {
             int center_x = (candidate.box[0] + candidate.box[2]) >> 1;
             int center_y = (candidate.box[1] + candidate.box[3]) >> 1;
