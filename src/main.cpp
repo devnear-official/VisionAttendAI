@@ -48,6 +48,14 @@ float currentFps = 0.0f;
 uint32_t lastInferTimeMs = 0;
 uint32_t detectedFaceCount = 0;
 
+// Stabilization & Capture State
+constexpr unsigned long FACE_STABLE_HOLD_MS = 1500; // Hold bounding box for 1.5 seconds if face temporarily drops
+constexpr unsigned long CAPTURE_DISPLAY_MS = 2000;  // Display "IMAGE CAPTURED" for 2 seconds
+std::list<dl::detect::result_t> stableFaces;
+unsigned long lastFaceSeenTime = 0;
+bool captureTriggered = false;
+unsigned long captureBannerExpiry = 0;
+
 void testPsram() {
   if (!psramFound() || heap_caps_get_total_size(MALLOC_CAP_SPIRAM) == 0) {
     psramTest = "unavailable to heap; no late reinitialization attempted";
@@ -219,6 +227,31 @@ void loop() {
       detectedFaceCount = results.size();
     }
 
+    unsigned long now = millis();
+
+    // Stabilization and Capture Logic:
+    if (!results.empty()) {
+      stableFaces = results; // Update with fresh detection boxes
+      lastFaceSeenTime = now;
+
+      // When a face is detected, trigger image capture event
+      if (!captureTriggered) {
+        captureTriggered = true;
+        captureBannerExpiry = now + CAPTURE_DISPLAY_MS;
+        Serial.printf(">>> [CAPTURE] Face detected (%d face(s)) - Image captured at %lums\n",
+                      (int)results.size(), now);
+      }
+    } else {
+      // If no face in this exact frame, check if within 1.5s stability hold window
+      if (now - lastFaceSeenTime > FACE_STABLE_HOLD_MS) {
+        stableFaces.clear();      // Expire bounding box after 1.5s of no face
+        captureTriggered = false; // Reset capture trigger for next person
+      }
+    }
+
+    bool hasActiveFace = !stableFaces.empty();
+    bool showCapturedNotice = (now < captureBannerExpiry);
+
     // 2. Render camera frame to TFT (160x120 doubled to 320x240 landscape)
     static uint16_t row[320];
     uint8_t *out = reinterpret_cast<uint8_t *>(row);
@@ -235,8 +268,8 @@ void loop() {
     }
     tft.endWrite();
 
-    // 3. Immediately draw Bounding Boxes and Landmarks (zero delay after frame draw)
-    for (const auto &res : results) {
+    // 3. Immediately draw Bounding Boxes and Landmarks from stableFaces (1-2s persistent)
+    for (const auto &res : stableFaces) {
       // Map 160x120 model coords to 320x240 display coords (x2 scaling)
       int bx = res.box[0] * 2;
       int by = res.box[1] * 2;
@@ -264,13 +297,16 @@ void loop() {
       }
     }
 
-    // 4. Draw HUD status banner with background fill (anti-flicker, no fillRect clear needed)
+    // 4. Draw HUD status banner (Capture notification, Active Face, or No Face)
     char hudBuf[36];
-    if (!results.empty()) {
-      snprintf(hudBuf, sizeof(hudBuf), " FACE DETECTED (%d) %lums ", (int)results.size(), (unsigned long)lastInferTimeMs);
+    if (showCapturedNotice) {
+      snprintf(hudBuf, sizeof(hudBuf), " [IMAGE CAPTURED] %lums    ", (unsigned long)lastInferTimeMs);
+      tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
+    } else if (hasActiveFace) {
+      snprintf(hudBuf, sizeof(hudBuf), " FACE DETECTED (%d) %lums ", (int)stableFaces.size(), (unsigned long)lastInferTimeMs);
       tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
     } else {
-      snprintf(hudBuf, sizeof(hudBuf), " NO FACE %lums       ", (unsigned long)lastInferTimeMs);
+      snprintf(hudBuf, sizeof(hudBuf), " NO FACE %lums            ", (unsigned long)lastInferTimeMs);
       tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
     }
     tft.setTextSize(1);
