@@ -41,9 +41,13 @@ router = APIRouter(prefix="/face", tags=["Face Recognition"])
 async def recognize_face(
     image: UploadFile = File(..., description="JPEG or PNG face crop from ESP32 edge camera"),
     device_id: Optional[str] = Form("ESP32-S3-CAM", description="Identifier/code of the transmitting device"),
-    landmarks_json: Optional[str] = Form(
+    landmarks: Optional[str] = Form(
         None,
         description="Optional JSON string of 5-point landmark coordinates relative to the crop"
+    ),
+    landmarks_json: Optional[str] = Form(
+        None,
+        description="Backward-compatible alias for landmarks field"
     ),
     db: Session = Depends(get_db),
     _authorized: bool = Depends(verify_device_key),
@@ -65,10 +69,11 @@ async def recognize_face(
         ImageValidator.validate_quality(img)
 
         # Align face if landmarks are transmitted from edge ESP32 detector
-        if landmarks_json:
+        raw_landmarks = landmarks or landmarks_json
+        if raw_landmarks:
             try:
-                landmarks = json.loads(landmarks_json)
-                aligned = FaceAligner.align_face_112(img, landmarks)
+                parsed_landmarks = json.loads(raw_landmarks)
+                aligned = FaceAligner.align_face_112(img, parsed_landmarks)
             except Exception:
                 import cv2
                 aligned = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LINEAR)

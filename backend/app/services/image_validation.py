@@ -103,6 +103,9 @@ class ImageValidator:
         else:
             pts = np.array(landmarks, dtype=np.float32)
 
+        if pts.shape == (10,):
+            pts = pts.reshape(5, 2)
+
         if pts.shape != (5, 2):
             raise LandmarkValidationError(
                 f"Landmarks must contain exactly 5 points of (x, y) coordinates. Found shape {pts.shape}."

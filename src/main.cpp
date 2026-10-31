@@ -13,6 +13,8 @@
 #include <stdlib.h>
 
 #include "face_detector.hpp"
+#include "network_config.h"
+#include "recognition_client.hpp"
 
 // GOOUUU ESP32-S3-CAM V1.3: GPIO9-13 are used by the camera.
 constexpr int TFT_CS = 47;
@@ -25,6 +27,38 @@ Adafruit_ILI9341 tft(&SPI, TFT_DC, TFT_CS, TFT_RST);
 
 FaceDetector faceDetector;
 bool faceDetectorReady = false;
+
+// Global recognition client
+RecognitionClient recognitionClient;
+
+// FreeRTOS background task communication for non-blocking HTTP requests
+struct RecognitionPayload {
+  uint8_t *jpeg_buf = nullptr;
+  size_t jpeg_len = 0;
+  char landmarks_json[96] = {0};
+};
+QueueHandle_t recognitionQueue = nullptr;
+
+void recognitionWorkerTask(void *param) {
+  RecognitionPayload payload;
+  while (true) {
+    if (xQueueReceive(recognitionQueue, &payload, portMAX_DELAY) == pdTRUE) {
+      Serial.printf("[TASK] Received crop for recognition (%u bytes JPEG)...\n", (unsigned)payload.jpeg_len);
+      RecognitionResult res = RecognitionClient::sendRecognitionRequest(
+        payload.jpeg_buf, payload.jpeg_len, payload.landmarks_json
+      );
+      // Free JPEG memory allocated by fmt2jpg
+      if (payload.jpeg_buf) {
+        free(payload.jpeg_buf);
+        payload.jpeg_buf = nullptr;
+      }
+      // Update result with 4-second display duration
+      recognitionClient.updateResult(res, 4000);
+      Serial.printf("[TASK] Finished recognition. Result: %s (Confidence: %.2f)\n",
+                    res.statusStr.c_str(), res.confidence);
+    }
+  }
+}
 
 bool cameraReady = false;
 const char *frameLocation = "not observed yet";
@@ -183,6 +217,27 @@ void setup() {
     (int)(psramFreeBeforeInit - psramFreeAfterInit),
     (int)(internalFreeBeforeInit - internalFreeAfterInit));
 
+  // Initialize Recognition Task on Core 0 (Network core)
+  recognitionQueue = xQueueCreate(1, sizeof(RecognitionPayload));
+  if (recognitionQueue != nullptr) {
+    xTaskCreatePinnedToCore(
+      recognitionWorkerTask,
+      "rec_worker",
+      8192,
+      nullptr,
+      1,
+      nullptr,
+      0 // Core 0
+    );
+    Serial.println("Recognition background task started on Core 0.");
+  }
+
+  // Connect to Wi-Fi
+  tft.setCursor(8, 80);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("Connecting to Wi-Fi...");
+  recognitionClient.initWiFi();
+
   printDiagnostics();
   lastDiagnostics = millis();
   fpsWindowStart = millis();
@@ -241,6 +296,40 @@ void loop() {
         Serial.printf(">>> [CAPTURE] Face detected (%d face(s)) - Image captured at %lums\n",
                       (int)results.size(), now);
       }
+
+      // Check if we can trigger recognition upload to FastAPI
+      if (recognitionClient.canTriggerRecognition()) {
+        const auto &primaryFace = results.front();
+        uint8_t *jpg_buf = nullptr;
+        size_t jpg_len = 0;
+        int cx = 0, cy = 0, cw = 0, ch = 0;
+
+        if (RecognitionClient::extractAndEncodeFaceCrop(
+              frame->buf, 160, 120, primaryFace.box,
+              &jpg_buf, &jpg_len, &cx, &cy, &cw, &ch)) {
+
+          RecognitionPayload payload;
+          payload.jpeg_buf = jpg_buf;
+          payload.jpeg_len = jpg_len;
+          payload.landmarks_json[0] = '\0';
+
+          if (primaryFace.keypoint.size() >= 10) {
+            RecognitionClient::transformLandmarksToCrop(
+              primaryFace.keypoint, cx, cy, cw, ch,
+              payload.landmarks_json, sizeof(payload.landmarks_json)
+            );
+          }
+
+          recognitionClient.setUploadInProgress(true);
+          if (xQueueSend(recognitionQueue, &payload, 0) != pdTRUE) {
+            free(jpg_buf);
+            recognitionClient.setUploadInProgress(false);
+          } else {
+            Serial.printf(">>> [UPLOAD] Queued face crop (%dx%d, %u bytes JPEG, landmarks: %s)\n",
+                          cw, ch, (unsigned)jpg_len, payload.landmarks_json);
+          }
+        }
+      }
     } else {
       // If no face in this exact frame, check if within 1.5s stability hold window
       if (now - lastFaceSeenTime > FACE_STABLE_HOLD_MS) {
@@ -297,21 +386,75 @@ void loop() {
       }
     }
 
-    // 4. Draw HUD status banner (Capture notification, Active Face, or No Face)
-    char hudBuf[36];
-    if (showCapturedNotice) {
-      snprintf(hudBuf, sizeof(hudBuf), " [IMAGE CAPTURED] %lums    ", (unsigned long)lastInferTimeMs);
-      tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
-    } else if (hasActiveFace) {
-      snprintf(hudBuf, sizeof(hudBuf), " FACE DETECTED (%d) %lums ", (int)stableFaces.size(), (unsigned long)lastInferTimeMs);
-      tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+    // 4. Draw HUD status banner and recognition state
+    RecognitionResult recRes = recognitionClient.getActiveResult();
+    bool isUploading = recognitionClient.isUploadInProgress();
+
+    if (isUploading) {
+      tft.fillRect(0, 0, 320, 20, ILI9341_NAVY);
+      tft.setTextColor(ILI9341_CYAN, ILI9341_NAVY);
+      tft.setTextSize(1);
+      tft.setCursor(6, 6);
+      tft.print(" [PROCESSING] IDENTIFYING FACE WITH ARCFACE... ");
+    } else if (recRes.state == REC_STATE_MATCH) {
+      tft.fillRect(0, 0, 320, 30, ILI9341_DARKGREEN);
+      tft.setTextColor(ILI9341_WHITE, ILI9341_DARKGREEN);
+      tft.setTextSize(1);
+      tft.setCursor(6, 4);
+      tft.printf("MATCH: %s (%s)", recRes.fullName.c_str(), recRes.studentId.c_str());
+
+      tft.setCursor(6, 17);
+      tft.setTextColor(ILI9341_YELLOW, ILI9341_DARKGREEN);
+      tft.printf("CONF: %.1f%% | %s",
+                 recRes.confidence * 100.0f,
+                 recRes.alreadyCheckedIn ? "ALREADY CHECKED IN" : "ATTENDANCE RECORDED");
+    } else if (recRes.state == REC_STATE_UNKNOWN) {
+      tft.fillRect(0, 0, 320, 20, ILI9341_MAROON);
+      tft.setTextColor(ILI9341_WHITE, ILI9341_MAROON);
+      tft.setTextSize(1);
+      tft.setCursor(6, 6);
+      tft.print(" UNKNOWN PERSON - ATTENDANCE NOT MARKED ");
+    } else if (recRes.state == REC_STATE_AMBIGUOUS) {
+      tft.fillRect(0, 0, 320, 20, ILI9341_ORANGE);
+      tft.setTextColor(ILI9341_BLACK, ILI9341_ORANGE);
+      tft.setTextSize(1);
+      tft.setCursor(6, 6);
+      tft.print(" AMBIGUOUS MATCH - PLEASE LOOK DIRECTLY AT CAMERA ");
+    } else if (recRes.state == REC_STATE_ERROR) {
+      tft.fillRect(0, 0, 320, 20, ILI9341_MAGENTA);
+      tft.setTextColor(ILI9341_WHITE, ILI9341_MAGENTA);
+      tft.setTextSize(1);
+      tft.setCursor(6, 6);
+      tft.printf(" SERVER ERROR: %s ", recRes.message.c_str());
     } else {
-      snprintf(hudBuf, sizeof(hudBuf), " NO FACE %lums            ", (unsigned long)lastInferTimeMs);
-      tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
+      // Default live tracking HUD
+      char hudBuf[36];
+      if (showCapturedNotice) {
+        snprintf(hudBuf, sizeof(hudBuf), " [IMAGE CAPTURED] %lums    ", (unsigned long)lastInferTimeMs);
+        tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
+      } else if (hasActiveFace) {
+        snprintf(hudBuf, sizeof(hudBuf), " FACE DETECTED (%d) %lums ", (int)stableFaces.size(), (unsigned long)lastInferTimeMs);
+        tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+      } else {
+        snprintf(hudBuf, sizeof(hudBuf), " NO FACE %lums            ", (unsigned long)lastInferTimeMs);
+        tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
+      }
+      tft.setTextSize(1);
+      tft.setCursor(4, 4);
+      tft.print(hudBuf);
     }
+
+    // Top-right Wi-Fi connection indicator
     tft.setTextSize(1);
-    tft.setCursor(4, 4);
-    tft.print(hudBuf);
+    if (recognitionClient.isWiFiConnected()) {
+      tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+      tft.setCursor(264, 4);
+      tft.print("[WIFI OK]");
+    } else {
+      tft.setTextColor(ILI9341_RED, ILI9341_BLACK);
+      tft.setCursor(256, 4);
+      tft.print("[WIFI OFF]");
+    }
 
     totalFramesRendered++;
     fpsFrameCount++;
