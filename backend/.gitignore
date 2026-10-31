@@ -22,7 +22,8 @@ models/*.pth
 *.pem
 *.key
 
-# Temporary artifacts
+# Temporary artifacts and test data
+tests/data/
 temp/
 logs/
 *.log

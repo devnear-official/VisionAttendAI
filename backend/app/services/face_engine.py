@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from typing import Dict, Any, Optional
+import cv2
 import numpy as np
 import onnxruntime as ort
 
@@ -113,19 +114,22 @@ class FaceRecognitionEngine:
                 f"Aligned face image must have shape (112, 112, 3). Received {aligned_face_112.shape}."
             )
 
-        # Preprocessing standard for ArcFace:
-        # 1. Normalization: (pixel - 127.5) / 128.0 (or 127.5)
-        # 2. Convert HWC (112, 112, 3) to CHW (3, 112, 112)
-        # 3. Add batch dimension -> (1, 3, 112, 112) float32
-        input_data = aligned_face_112.astype(np.float32)
-        input_data = (input_data - 127.5) / 128.0
-        input_data = np.transpose(input_data, (2, 0, 1))
-        input_data = np.expand_dims(input_data, axis=0)
+        # Standard InsightFace ArcFace Preprocessing:
+        # 1. Color channel swap: BGR to RGB (ArcFace models expect RGB)
+        # 2. Scaling and centering: (x - 127.5) / 127.5 = (x - 127.5) * (1 / 127.5)
+        # 3. Transpose HWC (112, 112, 3) to NCHW (1, 3, 112, 112) float32
+        blob = cv2.dnn.blobFromImages(
+            [aligned_face_112],
+            scalefactor=1.0 / 127.5,
+            size=(112, 112),
+            mean=(127.5, 127.5, 127.5),
+            swapRB=True,
+        )
 
         # Run inference
         outputs = self._session.run(
             [self._output_name],
-            {self._input_name: input_data}
+            {self._input_name: blob}
         )
 
         raw_embedding = outputs[0].flatten()

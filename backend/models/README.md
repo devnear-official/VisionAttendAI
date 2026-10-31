@@ -34,14 +34,19 @@ Copy `w600k_r50.onnx` into this `backend/models/` directory:
 cp ~/.insightface/models/buffalo_l/w600k_r50.onnx backend/models/
 ```
 
-### Method 2: Manual Download
-Download `w600k_r50.onnx` from the official InsightFace release archive and save it directly as:
+### Method 2: Direct Official Release Archive Download
+Download the official `buffalo_l.zip` archive directly from the DeepInsight GitHub releases:
+```text
+https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
+```
+Extract `w600k_r50.onnx` from the zip archive and place it at:
 ```text
 backend/models/w600k_r50.onnx
 ```
 
-### Expected File Specifications:
+### Verified File Specifications:
 - **Filename**: `w600k_r50.onnx`
-- **File size**: ~171 MB (179,726,670 bytes)
-- **Input shape**: `[batch_size, 3, 112, 112]` (float32, normalized)
-- **Output shape**: `[batch_size, 512]` (float32 feature embedding)
+- **File size**: `174,383,860 bytes` (~174.4 MB)
+- **Input shape**: `['None', 3, 112, 112]` (RGB float32, normalized via `(x - 127.5) / 127.5`)
+- **Output shape**: `[1, 512]` (512-D float32 ArcFace feature embedding, L2-normalized)
+- **Execution Provider**: CPUExecutionProvider (ONNX Runtime)
