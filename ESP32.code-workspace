@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../../Desktop/ESP32"
+		},
+		{
+			"name": "Vision",
+			"path": "."
+		}
+	],
+	"settings": {}
+}

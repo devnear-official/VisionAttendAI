@@ -7,11 +7,11 @@
 // Wi-Fi Access Point Credentials
 // NOTE: Set these to your local 2.4 GHz Wi-Fi network credentials.
 #ifndef WIFI_SSID
-#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_SSID "Asad"
 #endif
 
 #ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#define WIFI_PASSWORD "rifat7232"
 #endif
 
 // Local FastAPI Backend Configuration
@@ -30,13 +30,17 @@
 #endif
 
 // Device Authentication & Identification
-// Must match DEVICE_API_KEY in backend/.env
+// Place the cryptographically generated device key below:
+#ifndef ESP32_S3_DEVICE_KEY
+#define ESP32_S3_DEVICE_KEY "va_edge_SlyuBwB8H3LDFDsw4wHeb_mx5lqjzhJNyl-Or7FotJc"
+#endif
+
 #ifndef DEVICE_API_KEY
-#define DEVICE_API_KEY "esp32_device_secret_key_change_in_production"
+#define DEVICE_API_KEY ESP32_S3_DEVICE_KEY
 #endif
 
 #ifndef DEVICE_ID
-#define DEVICE_ID "ESP32-S3-CAM"
+#define DEVICE_ID "esp32-cam-01"
 #endif
 
 // Edge Pipeline Parameters

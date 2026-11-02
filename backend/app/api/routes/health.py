@@ -26,4 +26,11 @@ async def check_health() -> HealthResponse:
         model_loaded=face_engine.is_loaded,
         model_details=face_engine.get_status_details(),
         database=db_health,
+        similarity_thresholds={
+            "match_threshold": settings.SIMILARITY_MATCH_THRESHOLD,
+            "ambiguous_threshold": settings.SIMILARITY_AMBIGUOUS_THRESHOLD,
+            "min_face_width": settings.MIN_FACE_WIDTH,
+            "min_face_height": settings.MIN_FACE_HEIGHT,
+            "min_laplacian_variance": settings.MIN_LAPLACIAN_VARIANCE,
+        },
     )

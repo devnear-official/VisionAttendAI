@@ -49,13 +49,14 @@ def test_stage54_real_enrollment_workflow(
 
     db = db_session
 
-    # Ensure clean slate for test student
-    existing = db.execute(select(Student).where(Student.student_id == test_student_id)).scalar_one_or_none()
-    if existing:
-        db.query(AttendanceRecord).filter(AttendanceRecord.student_id == existing.id).delete()
-        db.query(StudentFaceEmbedding).filter(StudentFaceEmbedding.student_id == existing.id).delete()
-        db.delete(existing)
-        db.commit()
+    # Ensure clean slate for test student and any prior person1 student
+    for sid in [test_student_id, "STU-2024-001"]:
+        existing = db.execute(select(Student).where(Student.student_id == sid)).scalar_one_or_none()
+        if existing:
+            db.query(AttendanceRecord).filter(AttendanceRecord.student_id == existing.id).delete()
+            db.query(StudentFaceEmbedding).filter(StudentFaceEmbedding.student_id == existing.id).delete()
+            db.delete(existing)
+            db.commit()
 
     # 1. Enroll with 3 real images (person1_1, person1_2, person1_3)
     files = [
@@ -134,6 +135,15 @@ def test_stage54_real_recognition_and_attendance(
     db = db_session
     test_student_id = "STU-STAGE54-REC"
     test_name = "Stage 5.4 Recognition Student"
+
+    # Ensure clean slate for test student and any prior person1 student
+    for sid in [test_student_id, "STU-STAGE54-001", "STU-2024-001"]:
+        existing = db.execute(select(Student).where(Student.student_id == sid)).scalar_one_or_none()
+        if existing:
+            db.query(AttendanceRecord).filter(AttendanceRecord.student_id == existing.id).delete()
+            db.query(StudentFaceEmbedding).filter(StudentFaceEmbedding.student_id == existing.id).delete()
+            db.delete(existing)
+            db.commit()
 
     # Enroll student STU-STAGE54-REC with 3 real images
     enroll_files = [

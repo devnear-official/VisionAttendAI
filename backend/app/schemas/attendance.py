@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime, date
 from typing import Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AttendanceBase(BaseModel):
@@ -15,6 +15,9 @@ class AttendanceBase(BaseModel):
     recognition_confidence: Optional[float] = Field(default=None, description="Cosine similarity confidence score")
     recognition_method: str = Field("face_recognition", description="Method of verification")
     status: str = Field("present", description="Attendance status: present/late")
+    device_name: Optional[str] = Field(default=None, description="Verifying edge camera node name")
+    device_code: Optional[str] = Field(default=None, description="Verifying edge camera node code")
+    department: Optional[str] = Field(default=None, description="Student academic department")
 
 
 class AttendanceCreate(AttendanceBase):
@@ -26,8 +29,7 @@ class AttendanceResponse(AttendanceBase):
     student_id: Optional[uuid.UUID] = None
     created_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AttendanceListResponse(BaseModel):

@@ -3,3 +3,22 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Python & Backend
+backend/.venv/
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/models/*.onnx
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Node & Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/.env*
+!frontend/.env.example
+*.tsbuildinfo

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 from typing import Optional, List
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, ConfigDict, Field, EmailStr
 
 
 class StudentBase(BaseModel):
@@ -35,9 +35,10 @@ class StudentResponse(StudentBase):
     updated_at: datetime
     deleted_at: Optional[datetime] = None
     embeddings_count: int = 0
+    attendance_count: int = 0
+    last_attendance_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class StudentListResponse(BaseModel):

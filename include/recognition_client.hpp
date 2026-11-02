@@ -8,6 +8,7 @@
 #include "img_converters.h"
 #include "dl_detect_base.hpp"
 #include "network_config.h"
+#include "wifi_manager.hpp"
 
 enum RecognitionState {
     REC_STATE_IDLE,          // Waiting for face
@@ -16,7 +17,9 @@ enum RecognitionState {
     REC_STATE_MATCH,         // Student identity verified & attendance logged
     REC_STATE_UNKNOWN,       // Unknown person detected
     REC_STATE_AMBIGUOUS,     // Borderline confidence, please look again
-    REC_STATE_ERROR          // Network / HTTP / Server error
+    REC_STATE_ERROR,         // Network / HTTP / Server error
+    REC_STATE_ENROLLING,     // Biometric enrollment in progress (sample N/M)
+    REC_STATE_ENROLLED       // Biometric enrollment completed successfully
 };
 
 struct RecognitionResult {
@@ -30,6 +33,8 @@ struct RecognitionResult {
     bool attendanceRecorded = false;
     float inferenceTimeMs = 0.0f;
     String message = "";
+    int sampleIndex = 0;
+    int targetSamples = 0;
     unsigned long resultTimestamp = 0;
 };
 
@@ -234,8 +239,15 @@ public:
         WiFiClient client;
         client.setTimeout(HTTP_REQUEST_TIMEOUT_MS / 1000);
 
-        Serial.printf("[HTTP] Connecting to %s:%d...\n", BACKEND_HOST, BACKEND_PORT);
-        if (!client.connect(BACKEND_HOST, BACKEND_PORT)) {
+        const char *targetHost = (wifiConfigManager.getBackendHost().length() > 0)
+                               ? wifiConfigManager.getBackendHost().c_str()
+                               : BACKEND_HOST;
+        uint16_t targetPort = (wifiConfigManager.getBackendPort() > 0)
+                            ? wifiConfigManager.getBackendPort()
+                            : BACKEND_PORT;
+
+        Serial.printf("[HTTP] Connecting to %s:%d...\n", targetHost, targetPort);
+        if (!client.connect(targetHost, targetPort)) {
             result.message = "Connection Failed";
             Serial.println("[HTTP] Connection to backend failed.");
             return result;
@@ -268,7 +280,7 @@ public:
 
         // Send HTTP Request Headers
         client.printf("POST %s HTTP/1.1\r\n", BACKEND_PATH);
-        client.printf("Host: %s:%d\r\n", BACKEND_HOST, BACKEND_PORT);
+        client.printf("Host: %s:%d\r\n", targetHost, targetPort);
         client.printf("X-Device-Api-Key: %s\r\n", DEVICE_API_KEY);
         client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary);
         client.printf("Content-Length: %u\r\n", (unsigned)totalPayloadLength);
@@ -340,8 +352,22 @@ public:
             result.attendanceRecorded = doc["attendance_recorded"] | false;
             result.inferenceTimeMs = doc["inference_time_ms"] | 0.0f;
             result.message = doc["message"].as<const char*>() ? doc["message"].as<const char*>() : "";
+            result.sampleIndex = doc["sample_index"] | 0;
+            result.targetSamples = doc["target_samples"] | 0;
 
-            if (result.statusStr == "MATCH") {
+            if (result.statusStr == "ENROLLED" || result.message.startsWith("ENROLLED")) {
+                result.state = REC_STATE_ENROLLED;
+            } else if (result.statusStr == "ENROLLING" || result.message.startsWith("ENROLLING")) {
+                result.state = REC_STATE_ENROLLING;
+                if (result.sampleIndex == 0 && result.message.startsWith("ENROLLING ")) {
+                    // Parse "ENROLLING 1/3"
+                    int slashIdx = result.message.indexOf('/');
+                    if (slashIdx > 10) {
+                        result.sampleIndex = result.message.substring(10, slashIdx).toInt();
+                        result.targetSamples = result.message.substring(slashIdx + 1).toInt();
+                    }
+                }
+            } else if (result.statusStr == "MATCH") {
                 result.state = REC_STATE_MATCH;
             } else if (result.statusStr == "AMBIGUOUS") {
                 result.state = REC_STATE_AMBIGUOUS;

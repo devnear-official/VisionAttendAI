@@ -2,16 +2,26 @@
 
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.core.security import verify_admin_key
+from app.core.events import event_manager
+from app.core.security import verify_admin_key, verify_device_key
 from app.database.session import get_db
 from app.schemas.common import ErrorResponse, SuccessResponse
-from app.schemas.face import EnrollmentResponse, PersonResponse
+from app.schemas.face import (
+    DeviceSampleResponse,
+    EnrollmentResponse,
+    EnrollmentSessionCreate,
+    EnrollmentSessionResponse,
+    PersonResponse,
+)
 from app.schemas.student import StudentCreate
+from app.services.device_service import DeviceService
 from app.services.embedding_service import EmbeddingService
+from app.services.enrollment_session_service import EnrollmentSessionService
 from app.services.face_alignment import FaceAligner
 from app.services.face_engine import FaceRecognitionEngine, ModelNotAvailableError, face_engine
 from app.services.image_validation import ImageValidationError, ImageValidator, LandmarkValidationError
@@ -258,4 +268,342 @@ async def delete_person(
     return SuccessResponse(
         status="success",
         message=f"Student '{student.student_id}' ({student.full_name}) and biometric embeddings have been deactivated. Attendance history preserved.",
+    )
+
+
+@router.post(
+    "/enroll/session",
+    response_model=EnrollmentSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Initiate edge camera biometric enrollment session",
+    description="Registers an active temporary enrollment session on the selected edge camera. Requires Admin Bearer Token.",
+)
+async def create_enrollment_session(
+    payload: EnrollmentSessionCreate,
+    db: Session = Depends(get_db),
+    _authorized: bool = Depends(verify_admin_key),
+):
+    if not payload.consent_confirmed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Biometric consent confirmation is required to start an enrollment session.",
+        )
+
+    # Verify device exists and is active
+    device = DeviceService.get_by_code(db, payload.device_code)
+    if not device:
+        try:
+            val_uuid = uuid.UUID(payload.device_code)
+            device = DeviceService.get_by_id(db, val_uuid)
+        except ValueError:
+            pass
+
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Edge camera device '{payload.device_code}' not found in registry.",
+        )
+
+    if not device.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Edge device '{device.device_code}' is currently inactive.",
+        )
+
+    try:
+        session = EnrollmentSessionService.create_session(
+            student_id=payload.student_id,
+            name=payload.name,
+            department=payload.department,
+            batch=payload.batch,
+            device_code=device.device_code,
+            target_samples=payload.target_samples,
+            ttl_seconds=120,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+    # Broadcast session initiation to connected clients
+    try:
+        await event_manager.broadcast_attendance_event({
+            "event": "enrollment_session_started",
+            "session_id": session.session_id,
+            "student_id": session.student_id,
+            "student_name": session.name,
+            "device_code": session.device_code,
+            "target_samples": session.target_samples,
+            "expires_in_seconds": session.expires_in_seconds,
+        })
+    except Exception as e:
+        logger.warning(f"Failed to broadcast session start: {e}")
+
+    return EnrollmentSessionResponse(
+        session_id=session.session_id,
+        student_id=session.student_id,
+        name=session.name,
+        department=session.department,
+        batch=session.batch,
+        device_code=session.device_code,
+        target_samples=session.target_samples,
+        collected_count=session.collected_count,
+        status=session.status,
+        expires_in_seconds=session.expires_in_seconds,
+        created_at=datetime.fromtimestamp(session.created_at, timezone.utc).isoformat(),
+        message="Enrollment session initiated. Position student in front of camera.",
+    )
+
+
+@router.get(
+    "/enroll/session/{session_id}",
+    response_model=EnrollmentSessionResponse,
+    summary="Get enrollment session status",
+)
+async def get_enrollment_session_status(
+    session_id: str,
+    _authorized: bool = Depends(verify_admin_key),
+):
+    session = EnrollmentSessionService.get_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Enrollment session '{session_id}' not found or purged.",
+        )
+
+    return EnrollmentSessionResponse(
+        session_id=session.session_id,
+        student_id=session.student_id,
+        name=session.name,
+        department=session.department,
+        batch=session.batch,
+        device_code=session.device_code,
+        target_samples=session.target_samples,
+        collected_count=session.collected_count,
+        status=session.status,
+        expires_in_seconds=session.expires_in_seconds,
+        created_at=datetime.fromtimestamp(session.created_at, timezone.utc).isoformat(),
+        message=(
+            f"Enrollment commit failed: {session.error_message}"
+            if session.status == "failed" and session.error_message
+            else ("Session active" if session.status == "active" else f"Session is {session.status}")
+        ),
+    )
+
+
+@router.delete(
+    "/enroll/session/{session_id}",
+    response_model=SuccessResponse,
+    summary="Cancel active enrollment session",
+)
+async def cancel_enrollment_session(
+    session_id: str,
+    _authorized: bool = Depends(verify_admin_key),
+):
+    cancelled = EnrollmentSessionService.cancel_session(session_id)
+    if not cancelled:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Enrollment session '{session_id}' not active or not found.",
+        )
+
+    try:
+        await event_manager.broadcast_attendance_event({
+            "event": "enrollment_session_cancelled",
+            "session_id": session_id,
+        })
+    except Exception as e:
+        logger.warning(f"Failed to broadcast session cancel: {e}")
+
+    return SuccessResponse(
+        status="success",
+        message=f"Enrollment session '{session_id}' has been cancelled.",
+    )
+
+
+@router.post(
+    "/enroll/device-sample",
+    response_model=DeviceSampleResponse,
+    summary="Upload edge camera face sample for active enrollment session",
+    description="Processes and indexes face samples captured by ESP32-CAM. Requires X-Device-Api-Key.",
+)
+async def submit_device_enrollment_sample(
+    image: UploadFile = File(..., description="JPEG crop from edge camera"),
+    device_id: str = Form(..., description="Code or UUID of edge camera"),
+    session_id: Optional[str] = Form(None, description="Optional enrollment session UUID"),
+    landmarks: Optional[str] = Form(None, description="JSON array of 5 landmark pairs"),
+    db: Session = Depends(get_db),
+    _device_auth: bool = Depends(verify_device_key),
+):
+    if not face_engine.is_loaded:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Face recognition engine is unavailable.",
+        )
+
+    # 1. Resolve active session for device
+    session = None
+    if session_id:
+        session = EnrollmentSessionService.get_session(session_id)
+    if not session:
+        session = EnrollmentSessionService.get_active_session_for_device(device_id)
+
+    if not session or session.status != "active":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"No active enrollment session found for edge camera '{device_id}'.",
+        )
+
+    # 2. Parse landmarks if provided
+    parsed_landmarks = None
+    if landmarks:
+        try:
+            parsed_landmarks = json.loads(landmarks)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid landmarks format. Expected JSON array of coordinates.",
+            )
+
+    # 3. Read and validate raw image crop in memory
+    raw_bytes = await image.read()
+    try:
+        img = ImageValidator.decode_image_bytes(raw_bytes)
+        ImageValidator.validate_quality(img)
+
+        # Align with landmarks if available
+        if parsed_landmarks and len(parsed_landmarks) >= 5:
+            aligned = FaceAligner.align_face_112(img, parsed_landmarks)
+        else:
+            import cv2
+            aligned = cv2.resize(img, (112, 112), interpolation=cv2.INTER_LINEAR)
+
+        embedding = face_engine.extract_embedding(aligned)
+    except (ImageValidationError, LandmarkValidationError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Sample failed quality check: {str(e)}",
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Image processing failed: {str(e)}",
+        )
+
+    # 4. Duplicate face protection against other enrolled students
+    dup_match = VectorSearchService.check_duplicate_enrollment(
+        db,
+        [embedding],
+        exclude_student_id=session.student_id,
+        duplicate_threshold=0.70,
+    )
+    if dup_match is not None:
+        matched_student, score = dup_match
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Duplicate face detected! Matches '{matched_student.student_id}' ({matched_student.full_name}) at {score:.2f}.",
+        )
+
+    # 5. Append sample to session
+    try:
+        session, is_complete = EnrollmentSessionService.add_sample(
+            session_id=session.session_id,
+            embedding=embedding,
+            quality_score=1.0,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    # 6. Broadcast progress event to dashboard
+    try:
+        await event_manager.broadcast_attendance_event({
+            "event": "enrollment_sample_added",
+            "session_id": session.session_id,
+            "student_id": session.student_id,
+            "student_name": session.name,
+            "device_code": session.device_code,
+            "sample_index": session.collected_count,
+            "target_samples": session.target_samples,
+            "is_complete": is_complete,
+        })
+    except Exception as e:
+        logger.warning(f"Failed to broadcast sample add: {e}")
+
+    # 7. If target reached, commit to PostgreSQL transactionally
+    if is_complete:
+        try:
+            existing_student = StudentService.get_by_student_id(db, session.student_id, include_deleted=True)
+            if existing_student:
+                if existing_student.deleted_at is not None:
+                    existing_student.deleted_at = None
+                    existing_student.status = "active"
+                existing_student.full_name = session.name
+                if session.department:
+                    existing_student.department = session.department
+                if session.batch:
+                    existing_student.batch = session.batch
+                # Prevent duplicate active embeddings on re-enrollment
+                EmbeddingService.deactivate_embeddings(db, existing_student.id)
+                student = existing_student
+            else:
+                student_in = StudentCreate(
+                    student_id=session.student_id,
+                    full_name=session.name,
+                    department=session.department,
+                    batch=session.batch,
+                )
+                student = StudentService.create_student(db, student_in)
+
+            all_embeddings = [s.embedding for s in session.samples]
+            EmbeddingService.store_student_embeddings(db, student.id, all_embeddings)
+            db.commit()
+
+            # Mark session completed in memory store only after successful commit
+            EnrollmentSessionService.mark_completed(session.session_id)
+
+            logger.info(
+                f"Successfully committed {len(all_embeddings)} ArcFace templates for student '{student.student_id}'"
+            )
+
+            # Broadcast final completion event
+            try:
+                await event_manager.broadcast_attendance_event({
+                    "event": "enrollment_completed",
+                    "session_id": session.session_id,
+                    "student_id": student.student_id,
+                    "student_name": student.full_name,
+                    "device_code": session.device_code,
+                    "embeddings_count": len(all_embeddings),
+                })
+            except Exception as e:
+                logger.warning(f"Failed to broadcast completion: {e}")
+
+            return DeviceSampleResponse(
+                status="ENROLLED",
+                session_id=session.session_id,
+                sample_index=session.collected_count,
+                target_samples=session.target_samples,
+                student_id=student.student_id,
+                student_name=student.full_name,
+                message=f"Enrollment complete! {len(all_embeddings)} face templates indexed.",
+                instructions="Enrollment finished. Edge camera returning to normal recognition.",
+            )
+        except Exception as e:
+            db.rollback()
+            EnrollmentSessionService.mark_failed(session.session_id, str(e))
+            logger.error(f"Failed to persist student enrollment in database: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Database commit error during enrollment: {str(e)}",
+            )
+
+    # Partial sample collected; guide user for next pose
+    next_pose = "Please turn head slightly left." if session.collected_count == 1 else "Please turn head slightly right."
+    return DeviceSampleResponse(
+        status="ENROLLING",
+        session_id=session.session_id,
+        sample_index=session.collected_count,
+        target_samples=session.target_samples,
+        student_id=session.student_id,
+        student_name=session.name,
+        message=f"Sample {session.collected_count} of {session.target_samples} captured.",
+        instructions=next_pose,
     )

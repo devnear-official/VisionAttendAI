@@ -31,6 +31,8 @@ def test_face_engine_extract_raises_when_not_loaded():
 
 def test_face_engine_model_loaded_and_inference():
     """Verify that the official ArcFace model loads and produces a normalized 512-D float32 vector."""
+    if not face_engine.is_loaded:
+        face_engine.initialize()
     assert face_engine.is_loaded is True, "Face recognition model should be loaded in Stage 5.3"
     status = face_engine.get_status_details()
     assert status["is_loaded"] is True

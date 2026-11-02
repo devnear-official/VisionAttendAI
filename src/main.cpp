@@ -14,7 +14,11 @@
 
 #include "face_detector.hpp"
 #include "network_config.h"
+#include "wifi_manager.hpp"
 #include "recognition_client.hpp"
+
+// Global Wi-Fi and Server Configuration Manager
+WiFiConfigManager wifiConfigManager;
 
 // GOOUUU ESP32-S3-CAM V1.3: GPIO9-13 are used by the camera.
 constexpr int TFT_CS = 47;
@@ -66,6 +70,7 @@ void *lastFrameBuf = nullptr;
 bool frameInPsram = false;
 const char *psramTest = "not run";
 unsigned long lastDiagnostics = 0;
+uint16_t *detectBuf = nullptr; // Dedicated 160x120 fast decimation buffer for ESP-DL inference
 
 // Memory before and after model init
 size_t psramFreeBeforeInit = 0;
@@ -156,6 +161,16 @@ void setup() {
 
   testPsram();
 
+  // Allocate fast 160x120 buffer for ESP-DL inference (prefer ultra-fast internal SRAM)
+  detectBuf = static_cast<uint16_t *>(
+    heap_caps_malloc(160 * 120 * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
+  );
+  if (!detectBuf) {
+    detectBuf = static_cast<uint16_t *>(
+      heap_caps_malloc(160 * 120 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    );
+  }
+
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -175,12 +190,12 @@ void setup() {
   config.pin_vsync = 6;
   config.pin_href = 7;
   config.pin_pclk = 13;
-  config.xclk_freq_hz = 14000000;
+  config.xclk_freq_hz = 20000000;       // Boosted to 20MHz for 43% faster DMA transfer
   config.pixel_format = PIXFORMAT_RGB565;
-  config.frame_size = FRAMESIZE_QQVGA; // 160 x 120; doubled for display.
-  config.fb_count = 1;
+  config.frame_size = FRAMESIZE_QVGA;   // Upgraded to native 320 x 240 (4x resolution boost)
+  config.fb_count = 2;                  // Double buffering for non-blocking stream
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.grab_mode = CAMERA_GRAB_LATEST;// Always grab the freshest frame with zero latency
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -192,8 +207,10 @@ void setup() {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s != nullptr) {
-    s->set_vflip(s, 1); // Flip vertically so heads are upright
-    Serial.println("Camera sensor vflip enabled (upright orientation)");
+    s->set_vflip(s, 1);        // Flip vertically so heads are upright
+    s->set_brightness(s, 1);   // Enhance indoor face lighting (+1)
+    s->set_contrast(s, 1);     // Crisp face boundaries for landmark precision
+    Serial.println("Camera sensor configured: 320x240 @ 20MHz, double buffered");
   }
 
   tft.setCursor(8, 50);
@@ -232,11 +249,16 @@ void setup() {
     Serial.println("Recognition background task started on Core 0.");
   }
 
-  // Connect to Wi-Fi
+  // Connect to Wi-Fi with Captive Portal fallback
   tft.setCursor(8, 80);
   tft.setTextColor(ILI9341_WHITE);
   tft.print("Connecting to Wi-Fi...");
-  recognitionClient.initWiFi();
+  
+  wifiConfigManager.loadConfig();
+  if (!wifiConfigManager.connectStation(8000)) {
+    Serial.println("[WiFi] Saved network not reachable. Launching 'Setup' portal...");
+    wifiConfigManager.startPortal(&tft);
+  }
 
   printDiagnostics();
   lastDiagnostics = millis();
@@ -264,14 +286,24 @@ void loop() {
                   frameLocation, (unsigned)frame->len, frame->buf);
   }
 
-  if (frame->format == PIXFORMAT_RGB565 && frame->width == 160 &&
-      frame->height == 120 && frame->len >= 160U * 120U * 2U) {
+  if (frame->format == PIXFORMAT_RGB565 && frame->width == 320 &&
+      frame->height == 240 && frame->len >= 320U * 240U * 2U) {
 
-    // 1. Execute Face Detection in memory FIRST (Display is NOT touched during inference)
+    // 1. Execute Face Detection via Fast 2:1 Decimation (<0.5ms)
     std::list<dl::detect::result_t> results;
-    if (faceDetectorReady) {
+    if (faceDetectorReady && detectBuf != nullptr) {
+      // Downsample 320x240 to 160x120 by skipping every 2nd pixel
+      const uint16_t *src320 = reinterpret_cast<const uint16_t *>(frame->buf);
+      for (int y = 0; y < 120; ++y) {
+        const uint16_t *srcRow = src320 + (y * 2) * 320;
+        uint16_t *dstRow = detectBuf + y * 160;
+        for (int x = 0; x < 160; ++x) {
+          dstRow[x] = srcRow[x * 2];
+        }
+      }
+
       dl::image::img_t img;
-      img.data = frame->buf;
+      img.data = reinterpret_cast<uint8_t *>(detectBuf);
       img.width = 160;
       img.height = 120;
       img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
@@ -280,20 +312,31 @@ void loop() {
       results = faceDetector.detect(img);
       lastInferTimeMs = millis() - t0;
       detectedFaceCount = results.size();
+
+      // Scale detected bounding boxes and landmarks back to native 320x240 space
+      for (auto &res : results) {
+        res.box[0] *= 2;
+        res.box[1] *= 2;
+        res.box[2] *= 2;
+        res.box[3] *= 2;
+        for (size_t k = 0; k < res.keypoint.size(); ++k) {
+          res.keypoint[k] *= 2;
+        }
+      }
     }
 
     unsigned long now = millis();
 
     // Stabilization and Capture Logic:
     if (!results.empty()) {
-      stableFaces = results; // Update with fresh detection boxes
+      stableFaces = results; // Update with fresh detection boxes (320x240 space)
       lastFaceSeenTime = now;
 
       // When a face is detected, trigger image capture event
       if (!captureTriggered) {
         captureTriggered = true;
         captureBannerExpiry = now + CAPTURE_DISPLAY_MS;
-        Serial.printf(">>> [CAPTURE] Face detected (%d face(s)) - Image captured at %lums\n",
+        Serial.printf(">>> [CAPTURE] Face detected (%d face(s)) - High-Res image captured at %lums\n",
                       (int)results.size(), now);
       }
 
@@ -304,8 +347,9 @@ void loop() {
         size_t jpg_len = 0;
         int cx = 0, cy = 0, cw = 0, ch = 0;
 
+        // Extract high-resolution face crop from full 320x240 frame!
         if (RecognitionClient::extractAndEncodeFaceCrop(
-              frame->buf, 160, 120, primaryFace.box,
+              frame->buf, 320, 240, primaryFace.box,
               &jpg_buf, &jpg_len, &cx, &cy, &cw, &ch)) {
 
           RecognitionPayload payload;
@@ -325,7 +369,7 @@ void loop() {
             free(jpg_buf);
             recognitionClient.setUploadInProgress(false);
           } else {
-            Serial.printf(">>> [UPLOAD] Queued face crop (%dx%d, %u bytes JPEG, landmarks: %s)\n",
+            Serial.printf(">>> [UPLOAD] Queued HD face crop (%dx%d, %u bytes JPEG, landmarks: %s)\n",
                           cw, ch, (unsigned)jpg_len, payload.landmarks_json);
           }
         }
@@ -341,29 +385,21 @@ void loop() {
     bool hasActiveFace = !stableFaces.empty();
     bool showCapturedNotice = (now < captureBannerExpiry);
 
-    // 2. Render camera frame to TFT (160x120 doubled to 320x240 landscape)
-    static uint16_t row[320];
-    uint8_t *out = reinterpret_cast<uint8_t *>(row);
+    // 2. Render native 320x240 camera frame directly to TFT (Crystal Clear, zero duplication overhead)
     tft.startWrite();
     tft.setAddrWindow(0, 0, 320, 240);
-    for (size_t y = 0; y < 120; ++y) {
-      const uint8_t *src = frame->buf + y * 160 * 2;
-      for (size_t x = 0; x < 160; ++x) {
-        out[4*x] = out[4*x+2] = src[2*x];
-        out[4*x+1] = out[4*x+3] = src[2*x+1];
-      }
-      tft.writePixels(row, 320, true, true);
-      tft.writePixels(row, 320, true, true);
+    const uint16_t *frame16 = reinterpret_cast<const uint16_t *>(frame->buf);
+    for (size_t y = 0; y < 240; ++y) {
+      tft.writePixels(const_cast<uint16_t *>(frame16 + y * 320), 320, true, true);
     }
     tft.endWrite();
 
-    // 3. Immediately draw Bounding Boxes and Landmarks from stableFaces (1-2s persistent)
+    // 3. Immediately draw Bounding Boxes and Landmarks from stableFaces (Native 320x240 coordinates)
     for (const auto &res : stableFaces) {
-      // Map 160x120 model coords to 320x240 display coords (x2 scaling)
-      int bx = res.box[0] * 2;
-      int by = res.box[1] * 2;
-      int bw = (res.box[2] - res.box[0]) * 2;
-      int bh = (res.box[3] - res.box[1]) * 2;
+      int bx = res.box[0];
+      int by = res.box[1];
+      int bw = res.box[2] - res.box[0];
+      int bh = res.box[3] - res.box[1];
 
       if (bx < 0) bx = 0;
       if (by < 0) by = 0;
@@ -379,8 +415,8 @@ void loop() {
       // Draw facial landmarks if detected by MNP stage
       if (res.keypoint.size() >= 10) {
         for (size_t kp = 0; kp < 10; kp += 2) {
-          int kpx = res.keypoint[kp] * 2;
-          int kpy = res.keypoint[kp + 1] * 2;
+          int kpx = res.keypoint[kp];
+          int kpy = res.keypoint[kp + 1];
           tft.fillCircle(kpx, kpy, 2, ILI9341_CYAN);
         }
       }
@@ -408,6 +444,28 @@ void loop() {
       tft.printf("CONF: %.1f%% | %s",
                  recRes.confidence * 100.0f,
                  recRes.alreadyCheckedIn ? "ALREADY CHECKED IN" : "ATTENDANCE RECORDED");
+    } else if (recRes.state == REC_STATE_ENROLLING) {
+      tft.fillRect(0, 0, 320, 24, ILI9341_NAVY);
+      tft.setTextColor(ILI9341_CYAN, ILI9341_NAVY);
+      tft.setTextSize(1);
+      tft.setCursor(6, 4);
+      if (recRes.targetSamples > 0) {
+        tft.printf(" [ENROLLING %d/%d] %s ", recRes.sampleIndex, recRes.targetSamples, recRes.fullName.c_str());
+      } else {
+        tft.printf(" [ENROLLING] %s ", recRes.fullName.c_str());
+      }
+      tft.setCursor(6, 15);
+      tft.setTextColor(ILI9341_WHITE, ILI9341_NAVY);
+      tft.print("HOLD STILL / TURN SLIGHTLY FOR NEXT SAMPLE");
+    } else if (recRes.state == REC_STATE_ENROLLED) {
+      tft.fillRect(0, 0, 320, 24, ILI9341_DARKGREEN);
+      tft.setTextColor(ILI9341_WHITE, ILI9341_DARKGREEN);
+      tft.setTextSize(1);
+      tft.setCursor(6, 4);
+      tft.printf(" [ENROLLMENT COMPLETE] %s ", recRes.fullName.c_str());
+      tft.setCursor(6, 15);
+      tft.setTextColor(ILI9341_YELLOW, ILI9341_DARKGREEN);
+      tft.printf("STUDENT ID: %s | TEMPLATES COMMITTED", recRes.studentId.c_str());
     } else if (recRes.state == REC_STATE_UNKNOWN) {
       tft.fillRect(0, 0, 320, 20, ILI9341_MAROON);
       tft.setTextColor(ILI9341_WHITE, ILI9341_MAROON);

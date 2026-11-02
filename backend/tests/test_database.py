@@ -177,8 +177,8 @@ def test_attendance_and_duplicate_prevention(db_session: Session):
         db_session, StudentCreate(student_id=unique_id, full_name="Charlie Attendance")
     )
 
-    today = date.today()
     check_time = datetime.now(timezone.utc)
+    today = check_time.date()
 
     # 1. First check-in: succeeds
     rec1, was_new = AttendanceService.record_attendance(
@@ -242,9 +242,10 @@ def test_device_registration_and_authentication(db_session: Session):
     )
 
     # 1. Register device
-    device = DeviceService.register_device(db_session, dev_in)
+    device, plain_key = DeviceService.register_device(db_session, dev_in)
     assert device.id is not None
     assert device.device_code == code
+    assert plain_key == raw_key
     # API key must NOT be stored in plaintext
     assert device.api_key_hash != raw_key
     assert "$2b$" in device.api_key_hash  # bcrypt hash format

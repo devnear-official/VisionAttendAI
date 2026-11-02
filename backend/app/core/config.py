@@ -69,11 +69,11 @@ class Settings(BaseSettings):
         return v
 
     # Image Quality Thresholds
-    MIN_FACE_WIDTH: int = 48
-    MIN_FACE_HEIGHT: int = 48
-    MIN_LAPLACIAN_VARIANCE: float = 50.0  # Blur detection threshold
-    MIN_BRIGHTNESS: float = 25.0         # Underexposure threshold (0-255 scale)
-    MAX_BRIGHTNESS: float = 235.0        # Overexposure threshold (0-255 scale)
+    MIN_FACE_WIDTH: int = 36
+    MIN_FACE_HEIGHT: int = 36
+    MIN_LAPLACIAN_VARIANCE: float = 25.0  # Blur detection threshold
+    MIN_BRIGHTNESS: float = 20.0         # Underexposure threshold (0-255 scale)
+    MAX_BRIGHTNESS: float = 240.0        # Overexposure threshold (0-255 scale)
 
     # Database (PostgreSQL 17 + pgvector)
     DATABASE_URL: str = "postgresql+psycopg://postgres:postgres@localhost:5432/visionattend"

@@ -56,7 +56,7 @@ class EnrollmentResponse(BaseModel):
 
 class RecognitionResponse(BaseModel):
     status: MatchStatus
-    confidence: float = Field(..., ge=0.0, le=1.0)
+    confidence: float = Field(..., ge=-1.0, le=1.0)
     person_id: Optional[str] = None
     student_id: Optional[str] = None
     full_name: Optional[str] = None
@@ -67,3 +67,42 @@ class RecognitionResponse(BaseModel):
     attendance_id: Optional[str] = None
     inference_time_ms: float
     message: str
+
+
+class EnrollmentSessionCreate(BaseModel):
+    """Payload to initiate a new edge camera biometric enrollment session."""
+    student_id: str = Field(..., min_length=1, description="Unique university student ID")
+    name: str = Field(..., min_length=1, description="Student full name")
+    department: Optional[str] = Field(None, description="Department name or code")
+    batch: Optional[str] = Field(None, description="Academic batch or year")
+    device_code: str = Field(..., min_length=1, description="Edge camera device identifier")
+    target_samples: int = Field(default=3, ge=3, le=5, description="Number of face samples required (3 to 5)")
+    consent_confirmed: bool = Field(True, description="Biometric data privacy consent confirmation")
+
+
+class EnrollmentSessionResponse(BaseModel):
+    """Telemetry and status representation of an active enrollment session."""
+    session_id: str
+    student_id: str
+    name: str
+    department: Optional[str] = None
+    batch: Optional[str] = None
+    device_code: str
+    target_samples: int
+    collected_count: int
+    status: str
+    expires_in_seconds: int
+    created_at: str
+    message: Optional[str] = None
+
+
+class DeviceSampleResponse(BaseModel):
+    """Response returned to edge device during enrollment capture."""
+    status: str
+    session_id: Optional[str] = None
+    sample_index: int
+    target_samples: int
+    student_id: Optional[str] = None
+    student_name: Optional[str] = None
+    message: str
+    instructions: Optional[str] = None

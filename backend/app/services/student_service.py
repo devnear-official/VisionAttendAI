@@ -3,10 +3,10 @@
 import uuid
 from datetime import datetime, timezone
 from typing import List, Optional, Tuple
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from app.database.models import Student, StudentFaceEmbedding
+from app.database.models import AttendanceRecord, Student, StudentFaceEmbedding
 from app.schemas.student import StudentCreate, StudentUpdate
 from app.services.embedding_service import EmbeddingService
 from app.utils.logger import logger
@@ -41,6 +41,9 @@ class StudentService:
         skip: int = 0,
         limit: int = 50,
         status_filter: Optional[str] = None,
+        search: Optional[str] = None,
+        department: Optional[str] = None,
+        batch: Optional[str] = None,
         include_deleted: bool = False,
     ) -> Tuple[List[Student], int]:
         """List students with pagination and optional filtering."""
@@ -49,6 +52,18 @@ class StudentService:
             stmt = stmt.where(Student.deleted_at.is_(None))
         if status_filter:
             stmt = stmt.where(Student.status == status_filter)
+        if search:
+            search_term = f"%{search.strip()}%"
+            stmt = stmt.where(
+                or_(
+                    Student.student_id.ilike(search_term),
+                    Student.full_name.ilike(search_term),
+                )
+            )
+        if department:
+            stmt = stmt.where(Student.department == department.strip())
+        if batch:
+            stmt = stmt.where(Student.batch == batch.strip())
 
         total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar() or 0
         students = db.execute(stmt.order_by(Student.student_id.asc()).offset(skip).limit(limit)).scalars().all()
@@ -118,3 +133,25 @@ class StudentService:
             )
         )
         return db.execute(stmt).scalar() or 0
+
+    @staticmethod
+    def get_student_attendance_stats(
+        db: Session, student_id: str, student_uuid: uuid.UUID
+    ) -> Tuple[int, Optional[datetime]]:
+        """Get attendance check-in count and last attendance datetime for a student."""
+        stmt = (
+            select(
+                func.count(AttendanceRecord.id),
+                func.max(AttendanceRecord.check_in_time),
+            )
+            .where(
+                or_(
+                    AttendanceRecord.student_id == student_uuid,
+                    AttendanceRecord.student_id_snapshot == student_id,
+                )
+            )
+        )
+        row = db.execute(stmt).first()
+        if not row:
+            return 0, None
+        return int(row[0] or 0), row[1]

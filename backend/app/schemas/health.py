@@ -12,3 +12,4 @@ class HealthResponse(BaseModel):
     model_loaded: bool = Field(..., description="Whether the face recognition model is initialized in memory")
     model_details: Dict[str, Any] = Field(..., description="Model configuration and availability details")
     database: Dict[str, Any] = Field(..., description="PostgreSQL and pgvector connection health details")
+    similarity_thresholds: Dict[str, Any] = Field(default_factory=dict, description="Active cosine similarity decision thresholds")

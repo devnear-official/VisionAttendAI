@@ -5,7 +5,7 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import attendance, enrollment, health, recognition, students
+from app.api.routes import analytics, attendance, devices, enrollment, health, recognition, students, ws
 from app.core.config import get_settings
 from app.services.face_engine import face_engine
 from app.utils.logger import logger
@@ -70,6 +70,9 @@ app.include_router(enrollment.router, prefix="/api/v1")
 app.include_router(recognition.router, prefix="/api/v1")
 app.include_router(students.router, prefix="/api/v1")
 app.include_router(attendance.router, prefix="/api/v1")
+app.include_router(analytics.router, prefix="/api/v1")
+app.include_router(devices.router, prefix="/api/v1")
+app.include_router(ws.router, prefix="/api/v1")
 
 
 @app.get("/", include_in_schema=False)
