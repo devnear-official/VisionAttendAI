@@ -21,6 +21,7 @@ from app.services.face_alignment import FaceAligner
 from app.services.face_engine import FaceRecognitionEngine, ModelNotAvailableError, face_engine
 from app.services.image_validation import ImageValidationError, ImageValidator, LandmarkValidationError
 from app.services.student_service import StudentService
+from app.services.tts_service import TTSService
 from app.services.vector_search_service import VectorSearchService
 from app.utils.logger import logger
 
@@ -274,6 +275,26 @@ async def recognize_face(
         except Exception as e:
             logger.warning(f"Failed to broadcast attendance event: {e}")
 
+        # Synthesize personalized dynamic student name speech announcement
+        dev_code = "esp32-cam-01"
+        if dev and hasattr(dev, "device_code"):
+            dev_code = dev.device_code
+        elif device_id:
+            dev_code = device_id
+
+        has_speech = False
+        try:
+            if was_new:
+                speech = f"Welcome {matched_student.full_name}. Attendance recorded successfully."
+            else:
+                speech = f"{matched_student.full_name}, attendance already recorded."
+            pcm = TTSService.synthesize_cached_pcm(speech)
+            DeviceService.queue_pcm(dev_code, pcm)
+            DeviceService.queue_pcm("esp32-cam-01", pcm)
+            has_speech = True
+        except Exception as e:
+            logger.warning(f"Failed generating dynamic student speech announcement: {e}")
+
         return RecognitionResponse(
             status=MatchStatus.MATCH,
             confidence=safe_confidence,
@@ -286,6 +307,7 @@ async def recognize_face(
             already_checked_in=not was_new,
             attendance_id=str(record.id),
             inference_time_ms=elapsed_ms,
+            has_speech_audio=has_speech,
             message=(
                 f"Identity verified for student {matched_student.full_name} ({matched_student.student_id}). "
                 f"Attendance {'recorded' if was_new else 'already checked in today'}."

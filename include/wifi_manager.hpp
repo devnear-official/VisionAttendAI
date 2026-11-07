@@ -175,8 +175,12 @@ private:
         html += "label { display: block; margin-top: 14px; font-weight: 600; font-size: 13px; color: #cbd5e1; }";
         html += "input, select { width: 100%; box-sizing: border-box; padding: 10px 12px; margin-top: 6px; background: #0f172a; border: 1px solid #475569; border-radius: 8px; color: #fff; font-size: 15px; }";
         html += "input:focus, select:focus { border-color: #38bdf8; outline: none; }";
-        html += "button { width: 100%; margin-top: 22px; padding: 12px; background: #2563eb; color: #fff; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }";
-        html += "button:hover { background: #1d4ed8; }";
+        html += "button.btn-submit { width: 100%; margin-top: 22px; padding: 12px; background: #2563eb; color: #fff; border: none; border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer; }";
+        html += "button.btn-submit:hover { background: #1d4ed8; }";
+        html += ".pass-box { position: relative; display: flex; align-items: center; margin-top: 6px; }";
+        html += ".pass-box input { margin-top: 0; padding-right: 74px; }";
+        html += ".toggle-btn { position: absolute; right: 6px; width: auto; margin: 0; padding: 6px 12px; background: #334155; color: #cbd5e1; border: 1px solid #475569; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; }";
+        html += ".toggle-btn:hover { background: #475569; color: #fff; }";
         html += ".hint { font-size: 11px; color: #64748b; margin-top: 4px; }";
         html += "</style></head><body><div class='card'>";
         html += "<h2>VisionAttend-AI</h2>";
@@ -201,7 +205,10 @@ private:
 
         // Password
         html += "<label for='pass'>Wi-Fi Password:</label>";
+        html += "<div class='pass-box'>";
         html += "<input type='password' id='pass' name='pass' placeholder='Enter Wi-Fi password' value='" + m_password + "'>";
+        html += "<button type='button' id='togglePassBtn' class='toggle-btn' onclick='togglePass()'>Show</button>";
+        html += "</div>";
 
         // Backend Host IP
         html += "<label for='host'>Laptop Backend Server IP:</label>";
@@ -212,11 +219,17 @@ private:
         html += "<label for='port'>Backend Port:</label>";
         html += "<input type='number' id='port' name='port' value='" + String(m_backendPort) + "'>";
 
-        html += "<button type='submit'>Save & Connect</button>";
+        html += "<button type='submit' class='btn-submit'>Save & Connect</button>";
         html += "</form>";
         html += "</div>";
 
         html += "<script>";
+        html += "function togglePass() {";
+        html += "  var p = document.getElementById('pass');";
+        html += "  var btn = document.getElementById('togglePassBtn');";
+        html += "  if (p.type === 'password') { p.type = 'text'; btn.textContent = 'Hide'; }";
+        html += "  else { p.type = 'password'; btn.textContent = 'Show'; }";
+        html += "}";
         html += "function checkCustom(val) {";
         html += "  var customInput = document.getElementById('custom_ssid');";
         html += "  if (val === '__custom__') { customInput.style.display = 'block'; customInput.required = true; }";

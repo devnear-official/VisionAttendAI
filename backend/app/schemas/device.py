@@ -34,6 +34,7 @@ class DeviceResponse(DeviceBase):
     is_active: bool
     last_seen_at: Optional[datetime] = None
     created_at: datetime
+    speaker_enabled: bool = True
 
     @computed_field
     def is_online(self) -> bool:
@@ -72,3 +73,14 @@ class DeviceKeyRotationResponse(BaseModel):
 class DeviceListResponse(BaseModel):
     total: int
     devices: List[DeviceResponse]
+
+
+class DeviceSpeakerUpdate(BaseModel):
+    enabled: bool = Field(..., description="Whether edge device speaker output is enabled")
+
+
+class DeviceSpeakRequest(BaseModel):
+    text: str = Field(
+        ..., min_length=1, max_length=256, description="Text to synthesize and speak on edge device speaker"
+    )
+

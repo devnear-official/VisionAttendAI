@@ -21,6 +21,9 @@ import {
   RotateCw,
   Power,
   ShieldCheck,
+  Volume2,
+  VolumeX,
+  Send,
 } from "lucide-react";
 import { apiClient, ApiError } from "@/lib/api-client";
 
@@ -33,6 +36,7 @@ interface DeviceItem {
   last_seen_at: string | null;
   created_at: string;
   is_online: boolean;
+  speaker_enabled?: boolean;
 }
 
 interface DeviceListResponse {
@@ -71,6 +75,7 @@ export default function DevicesPage() {
   const [formLocation, setFormLocation] = useState("");
   const [provisionError, setProvisionError] = useState<string | null>(null);
   const [heartbeatSending, setHeartbeatSending] = useState<string | null>(null);
+  const [speakTexts, setSpeakTexts] = useState<Record<string, string>>({});
 
   // TanStack Query for Devices
   const {
@@ -159,6 +164,32 @@ export default function DevicesPage() {
     },
     onError: (err: ApiError) => {
       alert(`Deactivation failed: ${err.message}`);
+    },
+  });
+
+  // Toggle Speaker Mutation
+  const toggleSpeakerMutation = useMutation({
+    mutationFn: async ({ id, enabled }: { id: string; enabled: boolean }) => {
+      return apiClient.post(`/v1/devices/${id}/speaker`, { enabled });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["devices"] });
+    },
+    onError: (err: ApiError) => {
+      alert(`Speaker toggle failed: ${err.message}`);
+    },
+  });
+
+  // Speak Text Mutation
+  const speakTextMutation = useMutation({
+    mutationFn: async ({ id, text }: { id: string; text: string }) => {
+      return apiClient.post(`/v1/devices/${id}/speak`, { text });
+    },
+    onSuccess: (res: any) => {
+      alert(`Voice message queued! ${res.message || "Synthesized and sent to device."}`);
+    },
+    onError: (err: ApiError) => {
+      alert(`Text-to-speech failed: ${err.message}`);
     },
   });
 
@@ -318,6 +349,96 @@ export default function DevicesPage() {
                     <span className="font-medium text-slate-800 dark:text-slate-200">
                       {formatLastSeen(node.last_seen_at)}
                     </span>
+                  </div>
+
+                  {/* Edge Speaker & Custom Voice Announcement Box */}
+                  <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50/80 p-2.5 dark:border-slate-800 dark:bg-slate-900/60">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-1.5 font-semibold text-slate-800 dark:text-slate-200">
+                        {node.speaker_enabled !== false ? (
+                          <Volume2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+                        ) : (
+                          <VolumeX className="h-4 w-4 text-rose-500" />
+                        )}
+                        <span>Edge Speaker</span>
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() =>
+                          toggleSpeakerMutation.mutate({
+                            id: node.id,
+                            enabled: node.speaker_enabled === false,
+                          })
+                        }
+                        disabled={toggleSpeakerMutation.isPending}
+                        className={`h-6 px-2 text-[10px] font-medium transition-colors ${
+                          node.speaker_enabled !== false
+                            ? "border-emerald-300 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-400"
+                            : "border-rose-300 bg-rose-50 text-rose-700 hover:bg-rose-100 dark:border-rose-800 dark:bg-rose-950/30 dark:text-rose-400"
+                        }`}
+                      >
+                        {node.speaker_enabled !== false ? "ON (Active)" : "OFF (Muted)"}
+                      </Button>
+                    </div>
+
+                    <div className="space-y-1.5 pt-1">
+                      <div className="flex items-center gap-1">
+                        <Input
+                          placeholder="Type text to speak on device..."
+                          value={speakTexts[node.id] || ""}
+                          onChange={(e) =>
+                            setSpeakTexts((prev) => ({ ...prev, [node.id]: e.target.value }))
+                          }
+                          className="h-7 text-xs bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800"
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && (speakTexts[node.id] || "").trim()) {
+                              speakTextMutation.mutate({
+                                id: node.id,
+                                text: speakTexts[node.id].trim(),
+                              });
+                            }
+                          }}
+                        />
+                        <Button
+                          size="sm"
+                          disabled={!(speakTexts[node.id] || "").trim() || speakTextMutation.isPending}
+                          onClick={() => {
+                            const t = (speakTexts[node.id] || "").trim();
+                            if (t) speakTextMutation.mutate({ id: node.id, text: t });
+                          }}
+                          className="h-7 px-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] shrink-0 gap-1"
+                        >
+                          <Send className="h-3 w-3" />
+                          Speak
+                        </Button>
+                      </div>
+
+                      {/* Quick Presets */}
+                      <div className="flex flex-wrap gap-1 text-[10px] text-slate-500 pt-0.5">
+                        <span className="self-center mr-0.5 text-[9px] text-slate-400 uppercase font-semibold">Test:</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSpeakTexts((prev) => ({ ...prev, [node.id]: "Testing speaker 1 2 3" }));
+                            speakTextMutation.mutate({ id: node.id, text: "Testing speaker 1 2 3" });
+                          }}
+                          className="px-1.5 py-0.5 rounded bg-white hover:bg-slate-100 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 transition-colors"
+                        >
+                          "Testing 1 2 3"
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSpeakTexts((prev) => ({ ...prev, [node.id]: "Welcome, attendance recorded successfully." }));
+                            speakTextMutation.mutate({ id: node.id, text: "Welcome, attendance recorded successfully." });
+                          }}
+                          className="px-1.5 py-0.5 rounded bg-white hover:bg-slate-100 dark:bg-slate-800 dark:hover:bg-slate-700 border border-slate-200 dark:border-slate-700 transition-colors"
+                        >
+                          "Welcome"
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </CardContent>
               </div>

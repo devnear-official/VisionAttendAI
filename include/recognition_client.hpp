@@ -9,6 +9,7 @@
 #include "dl_detect_base.hpp"
 #include "network_config.h"
 #include "wifi_manager.hpp"
+#include "speaker_driver.hpp"
 
 enum RecognitionState {
     REC_STATE_IDLE,          // Waiting for face
@@ -35,6 +36,7 @@ struct RecognitionResult {
     String message = "";
     int sampleIndex = 0;
     int targetSamples = 0;
+    bool hasSpeechAudio = false;
     unsigned long resultTimestamp = 0;
 };
 
@@ -354,6 +356,7 @@ public:
             result.message = doc["message"].as<const char*>() ? doc["message"].as<const char*>() : "";
             result.sampleIndex = doc["sample_index"] | 0;
             result.targetSamples = doc["target_samples"] | 0;
+            result.hasSpeechAudio = doc["has_speech_audio"] | false;
 
             if (result.statusStr == "ENROLLED" || result.message.startsWith("ENROLLED")) {
                 result.state = REC_STATE_ENROLLED;
@@ -383,6 +386,80 @@ public:
         }
 
         return result;
+    }
+
+    // Polls backend heartbeat, synchronizes speaker status, and streams pending TTS audio
+    static void checkDeviceTelemetryAndAudio() {
+        if (WiFi.status() != WL_CONNECTED) return;
+
+        const char *targetHost = wifiConfigManager.getBackendHost().c_str();
+        uint16_t targetPort = wifiConfigManager.getBackendPort();
+
+        WiFiClient client;
+        client.setTimeout(2500);
+        if (!client.connect(targetHost, targetPort)) return;
+
+        // 1. Send Heartbeat POST
+        String path = "/api/v1/devices/heartbeat?device_code=" + String(DEVICE_ID);
+        client.printf("POST %s HTTP/1.1\r\n", path.c_str());
+        client.printf("Host: %s:%d\r\n", targetHost, targetPort);
+        client.printf("X-Device-Api-Key: %s\r\n", DEVICE_API_KEY);
+        client.print("Content-Length: 0\r\n");
+        client.print("Connection: close\r\n\r\n");
+
+        unsigned long timeout = millis() + 2500;
+        while (!client.available() && millis() < timeout) delay(10);
+        if (!client.available()) { client.stop(); return; }
+
+        String statusLine = client.readStringUntil('\n');
+        // Skip headers
+        while (client.available()) {
+            String l = client.readStringUntil('\n');
+            if (l == "\r" || l.length() == 0) break;
+        }
+
+        String body = "";
+        while (client.available()) body += client.readString();
+        client.stop();
+
+        JsonDocument doc;
+        if (deserializeJson(doc, body) == DeserializationError::Ok) {
+            bool speakerEnabled = doc["data"]["speaker_enabled"] | doc["speaker_enabled"] | true;
+            speakerDriver.setEnabled(speakerEnabled);
+
+            bool hasAudio = doc["data"]["has_pending_audio"] | doc["has_pending_audio"] | false;
+            if (hasAudio && speakerEnabled) {
+                // Fetch and stream the queued PCM audio from backend
+                WiFiClient audioClient;
+                audioClient.setTimeout(3500);
+                if (audioClient.connect(targetHost, targetPort)) {
+                    String audioPath = "/api/v1/devices/" + String(DEVICE_ID) + "/audio";
+                    audioClient.printf("GET %s HTTP/1.1\r\n", audioPath.c_str());
+                    audioClient.printf("Host: %s:%d\r\n", targetHost, targetPort);
+                    audioClient.printf("X-Device-Api-Key: %s\r\n", DEVICE_API_KEY);
+                    audioClient.print("Connection: close\r\n\r\n");
+
+                    unsigned long aTimeout = millis() + 3500;
+                    while (!audioClient.available() && millis() < aTimeout) delay(10);
+                    if (audioClient.available()) {
+                        String aStatus = audioClient.readStringUntil('\n');
+                        size_t contentLength = 0;
+                        while (audioClient.available()) {
+                            String hl = audioClient.readStringUntil('\n');
+                            if (hl.startsWith("Content-Length:") || hl.startsWith("content-length:")) {
+                                contentLength = hl.substring(15).toInt();
+                            }
+                            if (hl == "\r" || hl.length() == 0) break;
+                        }
+
+                        if (contentLength > 0) {
+                            speakerDriver.playRawStream(audioClient, contentLength);
+                        }
+                    }
+                    audioClient.stop();
+                }
+            }
+        }
     }
 };
 

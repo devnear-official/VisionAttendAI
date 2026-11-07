@@ -16,9 +16,16 @@
 #include "network_config.h"
 #include "wifi_manager.hpp"
 #include "recognition_client.hpp"
+#include "speaker_driver.hpp"
+#include "camera_guidance.hpp"
+#include "feedback_manager.hpp"
 
 // Global Wi-Fi and Server Configuration Manager
 WiFiConfigManager wifiConfigManager;
+
+// Global I2S Speaker & Audio Manager (MAX98357A on GPIO 38, 39, 40)
+SpeakerDriver speakerDriver;
+FeedbackManager feedbackManager;
 
 // GOOUUU ESP32-S3-CAM V1.3: GPIO9-13 are used by the camera.
 constexpr int TFT_CS = 47;
@@ -31,6 +38,7 @@ Adafruit_ILI9341 tft(&SPI, TFT_DC, TFT_CS, TFT_RST);
 
 FaceDetector faceDetector;
 bool faceDetectorReady = false;
+static uint8_t *downsampleBuf = nullptr;
 
 // Global recognition client
 RecognitionClient recognitionClient;
@@ -45,8 +53,11 @@ QueueHandle_t recognitionQueue = nullptr;
 
 void recognitionWorkerTask(void *param) {
   RecognitionPayload payload;
+  unsigned long lastTelemetryCheck = 0;
+
   while (true) {
-    if (xQueueReceive(recognitionQueue, &payload, portMAX_DELAY) == pdTRUE) {
+    // Wait up to 1500ms for incoming face crops to verify
+    if (xQueueReceive(recognitionQueue, &payload, pdMS_TO_TICKS(1500)) == pdTRUE) {
       Serial.printf("[TASK] Received crop for recognition (%u bytes JPEG)...\n", (unsigned)payload.jpeg_len);
       RecognitionResult res = RecognitionClient::sendRecognitionRequest(
         payload.jpeg_buf, payload.jpeg_len, payload.landmarks_json
@@ -58,8 +69,53 @@ void recognitionWorkerTask(void *param) {
       }
       // Update result with 4-second display duration
       recognitionClient.updateResult(res, 4000);
+
+      // Dynamic Personalized Student Name Voice Announcement:
+      // If backend synthesized personalized speech (e.g. "Welcome Rahim Ahmed. Attendance recorded successfully"),
+      // stream and speak it directly over I2S!
+      if (res.hasSpeechAudio && res.state == REC_STATE_MATCH && speakerDriver.isEnabled()) {
+        const char *targetHost = wifiConfigManager.getBackendHost().c_str();
+        uint16_t targetPort = wifiConfigManager.getBackendPort();
+        WiFiClient audioClient;
+        audioClient.setTimeout(3500);
+        if (audioClient.connect(targetHost, targetPort)) {
+          String audioPath = "/api/v1/devices/" + String(DEVICE_ID) + "/audio";
+          audioClient.printf("GET %s HTTP/1.1\r\n", audioPath.c_str());
+          audioClient.printf("Host: %s:%d\r\n", targetHost, targetPort);
+          audioClient.printf("X-Device-Api-Key: %s\r\n", DEVICE_API_KEY);
+          audioClient.print("Connection: close\r\n\r\n");
+
+          unsigned long aTimeout = millis() + 3500;
+          while (!audioClient.available() && millis() < aTimeout) delay(10);
+          if (audioClient.available()) {
+            String aStatus = audioClient.readStringUntil('\n');
+            size_t contentLength = 0;
+            while (audioClient.available()) {
+              String hl = audioClient.readStringUntil('\n');
+              if (hl.startsWith("Content-Length:") || hl.startsWith("content-length:")) {
+                contentLength = hl.substring(15).toInt();
+              }
+              if (hl == "\r" || hl.length() == 0) break;
+            }
+            if (contentLength > 0) {
+              speakerDriver.playRawStream(audioClient, contentLength);
+            }
+          }
+          audioClient.stop();
+        }
+      } else {
+        feedbackManager.handleRecognitionResult(res);
+      }
+
       Serial.printf("[TASK] Finished recognition. Result: %s (Confidence: %.2f)\n",
                     res.statusStr.c_str(), res.confidence);
+    } else {
+      // Idle cycle: Periodically check backend telemetry, speaker on/off state, and pending audio (every 2.5s)
+      unsigned long now = millis();
+      if (now - lastTelemetryCheck >= 2500) {
+        lastTelemetryCheck = now;
+        RecognitionClient::checkDeviceTelemetryAndAudio();
+      }
     }
   }
 }
@@ -70,7 +126,6 @@ void *lastFrameBuf = nullptr;
 bool frameInPsram = false;
 const char *psramTest = "not run";
 unsigned long lastDiagnostics = 0;
-uint16_t *detectBuf = nullptr; // Dedicated 160x120 fast decimation buffer for ESP-DL inference
 
 // Memory before and after model init
 size_t psramFreeBeforeInit = 0;
@@ -90,6 +145,8 @@ uint32_t detectedFaceCount = 0;
 // Stabilization & Capture State
 constexpr unsigned long FACE_STABLE_HOLD_MS = 1500; // Hold bounding box for 1.5 seconds if face temporarily drops
 constexpr unsigned long CAPTURE_DISPLAY_MS = 2000;  // Display "IMAGE CAPTURED" for 2 seconds
+constexpr int HUD_HEIGHT = 20;                      // Dedicated top status bar height (flicker-free)
+static GFXcanvas16 hudCanvas(320, HUD_HEIGHT);     // Off-screen canvas for 100% flicker-free HUD blitting
 std::list<dl::detect::result_t> stableFaces;
 unsigned long lastFaceSeenTime = 0;
 bool captureTriggered = false;
@@ -161,16 +218,6 @@ void setup() {
 
   testPsram();
 
-  // Allocate fast 160x120 buffer for ESP-DL inference (prefer ultra-fast internal SRAM)
-  detectBuf = static_cast<uint16_t *>(
-    heap_caps_malloc(160 * 120 * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)
-  );
-  if (!detectBuf) {
-    detectBuf = static_cast<uint16_t *>(
-      heap_caps_malloc(160 * 120 * sizeof(uint16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-    );
-  }
-
   camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -190,12 +237,12 @@ void setup() {
   config.pin_vsync = 6;
   config.pin_href = 7;
   config.pin_pclk = 13;
-  config.xclk_freq_hz = 20000000;       // Boosted to 20MHz for 43% faster DMA transfer
+  config.xclk_freq_hz = 14000000;
   config.pixel_format = PIXFORMAT_RGB565;
-  config.frame_size = FRAMESIZE_QVGA;   // Upgraded to native 320 x 240 (4x resolution boost)
-  config.fb_count = 2;                  // Double buffering for non-blocking stream
+  config.frame_size = FRAMESIZE_QVGA; // 320 x 240 Native High-Definition
+  config.fb_count = 1;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.grab_mode = CAMERA_GRAB_LATEST;// Always grab the freshest frame with zero latency
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -207,10 +254,16 @@ void setup() {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s != nullptr) {
-    s->set_vflip(s, 1);        // Flip vertically so heads are upright
-    s->set_brightness(s, 1);   // Enhance indoor face lighting (+1)
-    s->set_contrast(s, 1);     // Crisp face boundaries for landmark precision
-    Serial.println("Camera sensor configured: 320x240 @ 20MHz, double buffered");
+    s->set_vflip(s, 1); // Flip vertically so heads are upright
+    s->set_brightness(s, 1);
+    s->set_contrast(s, 1);
+    Serial.println("Camera sensor initialized at 320x240 High Resolution");
+  }
+
+  // Allocate 160x120 downsample buffer in PSRAM for real-time face detection
+  downsampleBuf = (uint8_t*)ps_malloc(160 * 120 * 2);
+  if (!downsampleBuf) {
+    downsampleBuf = (uint8_t*)malloc(160 * 120 * 2);
   }
 
   tft.setCursor(8, 50);
@@ -260,10 +313,139 @@ void setup() {
     wifiConfigManager.startPortal(&tft);
   }
 
+  // Initialize I2S Audio Driver (MAX98357A on GPIO 38, 39, 40)
+  tft.setCursor(8, 110);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.print("Starting I2S Audio...");
+  speakerDriver.init();
+
   printDiagnostics();
   lastDiagnostics = millis();
   fpsWindowStart = millis();
   tft.fillScreen(ILI9341_BLACK);
+}
+
+// -----------------------------------------------------------------------------
+// Full-Screen Recognition Result Cards (Large bold text, high-contrast, beautiful)
+// -----------------------------------------------------------------------------
+void drawCenteredText(const String &text, int y, uint8_t size, uint16_t color, uint16_t bg = ILI9341_BLACK) {
+  tft.setTextSize(size);
+  tft.setTextColor(color, bg);
+  int textWidth = text.length() * 6 * size;
+  int x = (320 - textWidth) / 2;
+  if (x < 4) x = 4;
+  tft.setCursor(x, y);
+  tft.print(text);
+}
+
+void drawFullScreenMatch(const RecognitionResult &res) {
+  tft.fillScreen(ILI9341_BLACK);
+
+  // Top Header Banner
+  uint16_t bannerColor = res.alreadyCheckedIn ? ILI9341_BLUE : ILI9341_DARKGREEN;
+  tft.fillRect(0, 0, 320, 48, bannerColor);
+  tft.drawRect(0, 0, 320, 48, ILI9341_GREEN);
+
+  String headerStr = res.alreadyCheckedIn ? "ALREADY CHECKED IN" : "ATTENDANCE RECORDED";
+  drawCenteredText(headerStr, 16, 2, ILI9341_WHITE, bannerColor);
+
+  // Student Full Name (Big, bold)
+  uint8_t nameSize = (res.fullName.length() > 17) ? 2 : 3;
+  drawCenteredText(res.fullName, 68, nameSize, ILI9341_WHITE, ILI9341_BLACK);
+
+  // Student ID
+  String idStr = "ID: " + res.studentId;
+  drawCenteredText(idStr, 108, 2, ILI9341_YELLOW, ILI9341_BLACK);
+
+  // Department if available
+  if (res.department.length() > 0) {
+    drawCenteredText("Dept: " + res.department, 136, 1, ILI9341_LIGHTGREY, ILI9341_BLACK);
+  }
+
+  // Match Confidence Box
+  tft.drawRoundRect(20, 155, 280, 42, 8, ILI9341_DARKGREEN);
+  tft.fillRoundRect(22, 157, 276, 38, 6, (uint16_t)0x01E0);
+  char confBuf[40];
+  snprintf(confBuf, sizeof(confBuf), "Match Confidence: %.1f%%", res.confidence * 100.0f);
+  drawCenteredText(confBuf, 168, 2, ILI9341_GREEN, (uint16_t)0x01E0);
+
+  // Bottom Notice
+  drawCenteredText("Verified by Face Recognition", 215, 1, ILI9341_LIGHTGREY, ILI9341_BLACK);
+}
+
+void drawFullScreenUnknown(const RecognitionResult &res) {
+  tft.fillScreen(ILI9341_BLACK);
+
+  tft.fillRect(0, 0, 320, 48, ILI9341_MAROON);
+  tft.drawRect(0, 0, 320, 48, ILI9341_RED);
+  drawCenteredText("ACCESS DENIED", 16, 2, ILI9341_WHITE, ILI9341_MAROON);
+
+  drawCenteredText("UNKNOWN PERSON", 75, 3, ILI9341_RED, ILI9341_BLACK);
+  drawCenteredText("Face not in database", 120, 2, ILI9341_YELLOW, ILI9341_BLACK);
+
+  tft.drawRoundRect(20, 155, 280, 42, 8, ILI9341_MAROON);
+  drawCenteredText("Attendance NOT marked", 168, 2, ILI9341_RED, ILI9341_BLACK);
+
+  drawCenteredText("Please contact admin to register", 215, 1, ILI9341_LIGHTGREY, ILI9341_BLACK);
+}
+
+void drawFullScreenAmbiguous(const RecognitionResult &res) {
+  tft.fillScreen(ILI9341_BLACK);
+
+  tft.fillRect(0, 0, 320, 48, ILI9341_ORANGE);
+  drawCenteredText("LOW CONFIDENCE", 16, 2, ILI9341_BLACK, ILI9341_ORANGE);
+
+  drawCenteredText("PLEASE TRY AGAIN", 75, 2, ILI9341_WHITE, ILI9341_BLACK);
+  drawCenteredText("Look directly at camera", 115, 2, ILI9341_YELLOW, ILI9341_BLACK);
+
+  drawCenteredText("Hold still and avoid harsh shadows", 170, 1, ILI9341_LIGHTGREY, ILI9341_BLACK);
+}
+
+void drawFullScreenError(const RecognitionResult &res) {
+  tft.fillScreen(ILI9341_BLACK);
+
+  tft.fillRect(0, 0, 320, 48, ILI9341_MAGENTA);
+  drawCenteredText("SERVER NOTICE", 16, 2, ILI9341_WHITE, ILI9341_MAGENTA);
+
+  drawCenteredText("CONNECTION ISSUE", 75, 2, ILI9341_RED, ILI9341_BLACK);
+  drawCenteredText(res.message, 115, 2, ILI9341_YELLOW, ILI9341_BLACK);
+
+  drawCenteredText("Please check Wi-Fi & Backend Server", 170, 1, ILI9341_LIGHTGREY, ILI9341_BLACK);
+}
+
+void drawFullScreenEnrolling(const RecognitionResult &res) {
+  tft.fillScreen(ILI9341_BLACK);
+
+  tft.fillRect(0, 0, 320, 48, ILI9341_NAVY);
+  tft.drawRect(0, 0, 320, 48, ILI9341_CYAN);
+  drawCenteredText("ENROLLING FACE", 16, 2, ILI9341_CYAN, ILI9341_NAVY);
+
+  char sampleBuf[32];
+  if (res.targetSamples > 0) {
+    snprintf(sampleBuf, sizeof(sampleBuf), "Sample %d of %d", res.sampleIndex, res.targetSamples);
+  } else {
+    snprintf(sampleBuf, sizeof(sampleBuf), "Capturing Sample...");
+  }
+  drawCenteredText(sampleBuf, 70, 2, ILI9341_YELLOW, ILI9341_BLACK);
+  drawCenteredText(res.fullName, 105, 2, ILI9341_WHITE, ILI9341_BLACK);
+
+  drawCenteredText("Hold still / Turn head slightly", 165, 1, ILI9341_LIGHTGREY, ILI9341_BLACK);
+}
+
+void drawFullScreenEnrolled(const RecognitionResult &res) {
+  tft.fillScreen(ILI9341_BLACK);
+
+  tft.fillRect(0, 0, 320, 48, ILI9341_DARKGREEN);
+  tft.drawRect(0, 0, 320, 48, ILI9341_GREEN);
+  drawCenteredText("ENROLLMENT COMPLETE", 16, 2, ILI9341_WHITE, ILI9341_DARKGREEN);
+
+  drawCenteredText(res.fullName, 75, 3, ILI9341_WHITE, ILI9341_BLACK);
+  drawCenteredText("ID: " + res.studentId, 120, 2, ILI9341_YELLOW, ILI9341_BLACK);
+
+  tft.drawRoundRect(20, 155, 280, 42, 8, ILI9341_DARKGREEN);
+  drawCenteredText("Templates Committed", 168, 2, ILI9341_GREEN, ILI9341_BLACK);
+
+  drawCenteredText("Student ready for recognition", 215, 1, ILI9341_LIGHTGREY, ILI9341_BLACK);
 }
 
 void loop() {
@@ -289,21 +471,22 @@ void loop() {
   if (frame->format == PIXFORMAT_RGB565 && frame->width == 320 &&
       frame->height == 240 && frame->len >= 320U * 240U * 2U) {
 
-    // 1. Execute Face Detection via Fast 2:1 Decimation (<0.5ms)
-    std::list<dl::detect::result_t> results;
-    if (faceDetectorReady && detectBuf != nullptr) {
-      // Downsample 320x240 to 160x120 by skipping every 2nd pixel
-      const uint16_t *src320 = reinterpret_cast<const uint16_t *>(frame->buf);
+    // 1. Downsample 320x240 to 160x120 for real-time ESP-DL inference (takes <0.15ms)
+    if (downsampleBuf) {
       for (int y = 0; y < 120; ++y) {
-        const uint16_t *srcRow = src320 + (y * 2) * 320;
-        uint16_t *dstRow = detectBuf + y * 160;
+        const uint16_t *srcRow = reinterpret_cast<const uint16_t*>(frame->buf + (y * 2) * 320 * 2);
+        uint16_t *dstRow = reinterpret_cast<uint16_t*>(downsampleBuf + y * 160 * 2);
         for (int x = 0; x < 160; ++x) {
           dstRow[x] = srcRow[x * 2];
         }
       }
+    }
 
+    // 2. Execute Face Detection in memory FIRST (Display is NOT touched during inference)
+    std::list<dl::detect::result_t> results;
+    if (faceDetectorReady && downsampleBuf) {
       dl::image::img_t img;
-      img.data = reinterpret_cast<uint8_t *>(detectBuf);
+      img.data = downsampleBuf;
       img.width = 160;
       img.height = 120;
       img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
@@ -312,31 +495,20 @@ void loop() {
       results = faceDetector.detect(img);
       lastInferTimeMs = millis() - t0;
       detectedFaceCount = results.size();
-
-      // Scale detected bounding boxes and landmarks back to native 320x240 space
-      for (auto &res : results) {
-        res.box[0] *= 2;
-        res.box[1] *= 2;
-        res.box[2] *= 2;
-        res.box[3] *= 2;
-        for (size_t k = 0; k < res.keypoint.size(); ++k) {
-          res.keypoint[k] *= 2;
-        }
-      }
     }
 
     unsigned long now = millis();
 
     // Stabilization and Capture Logic:
     if (!results.empty()) {
-      stableFaces = results; // Update with fresh detection boxes (320x240 space)
+      stableFaces = results; // Update with fresh detection boxes
       lastFaceSeenTime = now;
 
       // When a face is detected, trigger image capture event
       if (!captureTriggered) {
         captureTriggered = true;
         captureBannerExpiry = now + CAPTURE_DISPLAY_MS;
-        Serial.printf(">>> [CAPTURE] Face detected (%d face(s)) - High-Res image captured at %lums\n",
+        Serial.printf(">>> [CAPTURE] Face detected (%d face(s)) - Image captured at %lums\n",
                       (int)results.size(), now);
       }
 
@@ -347,9 +519,16 @@ void loop() {
         size_t jpg_len = 0;
         int cx = 0, cy = 0, cw = 0, ch = 0;
 
-        // Extract high-resolution face crop from full 320x240 frame!
+        // Scale bounding box x2 to crop directly from full-resolution 320x240 frame buffer
+        std::vector<int> box320 = {
+          primaryFace.box[0] * 2,
+          primaryFace.box[1] * 2,
+          primaryFace.box[2] * 2,
+          primaryFace.box[3] * 2
+        };
+
         if (RecognitionClient::extractAndEncodeFaceCrop(
-              frame->buf, 320, 240, primaryFace.box,
+              frame->buf, 320, 240, box320,
               &jpg_buf, &jpg_len, &cx, &cy, &cw, &ch)) {
 
           RecognitionPayload payload;
@@ -358,8 +537,12 @@ void loop() {
           payload.landmarks_json[0] = '\0';
 
           if (primaryFace.keypoint.size() >= 10) {
+            std::vector<int> kp320;
+            for (size_t k = 0; k < primaryFace.keypoint.size(); ++k) {
+              kp320.push_back(primaryFace.keypoint[k] * 2);
+            }
             RecognitionClient::transformLandmarksToCrop(
-              primaryFace.keypoint, cx, cy, cw, ch,
+              kp320, cx, cy, cw, ch,
               payload.landmarks_json, sizeof(payload.landmarks_json)
             );
           }
@@ -369,7 +552,7 @@ void loop() {
             free(jpg_buf);
             recognitionClient.setUploadInProgress(false);
           } else {
-            Serial.printf(">>> [UPLOAD] Queued HD face crop (%dx%d, %u bytes JPEG, landmarks: %s)\n",
+            Serial.printf(">>> [UPLOAD] Queued HIGH-RES face crop (%dx%d, %u bytes JPEG, landmarks: %s)\n",
                           cw, ch, (unsigned)jpg_len, payload.landmarks_json);
           }
         }
@@ -385,133 +568,132 @@ void loop() {
     bool hasActiveFace = !stableFaces.empty();
     bool showCapturedNotice = (now < captureBannerExpiry);
 
-    // 2. Render native 320x240 camera frame directly to TFT (Crystal Clear, zero duplication overhead)
-    tft.startWrite();
-    tft.setAddrWindow(0, 0, 320, 240);
-    const uint16_t *frame16 = reinterpret_cast<const uint16_t *>(frame->buf);
-    for (size_t y = 0; y < 240; ++y) {
-      tft.writePixels(const_cast<uint16_t *>(frame16 + y * 320), 320, true, true);
-    }
-    tft.endWrite();
-
-    // 3. Immediately draw Bounding Boxes and Landmarks from stableFaces (Native 320x240 coordinates)
-    for (const auto &res : stableFaces) {
-      int bx = res.box[0];
-      int by = res.box[1];
-      int bw = res.box[2] - res.box[0];
-      int bh = res.box[3] - res.box[1];
-
-      if (bx < 0) bx = 0;
-      if (by < 0) by = 0;
-      if (bx + bw > 320) bw = 320 - bx;
-      if (by + bh > 240) bh = 240 - by;
-
-      // Draw 2-pixel thick green bounding box
-      tft.drawRect(bx, by, bw, bh, ILI9341_GREEN);
-      if (bw > 2 && bh > 2) {
-        tft.drawRect(bx + 1, by + 1, bw - 2, bh - 2, ILI9341_GREEN);
-      }
-
-      // Draw facial landmarks if detected by MNP stage
-      if (res.keypoint.size() >= 10) {
-        for (size_t kp = 0; kp < 10; kp += 2) {
-          int kpx = res.keypoint[kp];
-          int kpy = res.keypoint[kp + 1];
-          tft.fillCircle(kpx, kpy, 2, ILI9341_CYAN);
-        }
-      }
-    }
-
-    // 4. Draw HUD status banner and recognition state
+    // 4. Check for Full-Screen Recognition Result (Match / Unknown / Error / Enrolling)
     RecognitionResult recRes = recognitionClient.getActiveResult();
     bool isUploading = recognitionClient.isUploadInProgress();
 
-    if (isUploading) {
-      tft.fillRect(0, 0, 320, 20, ILI9341_NAVY);
-      tft.setTextColor(ILI9341_CYAN, ILI9341_NAVY);
-      tft.setTextSize(1);
-      tft.setCursor(6, 6);
-      tft.print(" [PROCESSING] IDENTIFYING FACE WITH ARCFACE... ");
-    } else if (recRes.state == REC_STATE_MATCH) {
-      tft.fillRect(0, 0, 320, 30, ILI9341_DARKGREEN);
-      tft.setTextColor(ILI9341_WHITE, ILI9341_DARKGREEN);
-      tft.setTextSize(1);
-      tft.setCursor(6, 4);
-      tft.printf("MATCH: %s (%s)", recRes.fullName.c_str(), recRes.studentId.c_str());
+    bool hasFullScreenResult = (recRes.state == REC_STATE_MATCH ||
+                                recRes.state == REC_STATE_UNKNOWN ||
+                                recRes.state == REC_STATE_AMBIGUOUS ||
+                                recRes.state == REC_STATE_ERROR ||
+                                recRes.state == REC_STATE_ENROLLING ||
+                                recRes.state == REC_STATE_ENROLLED);
 
-      tft.setCursor(6, 17);
-      tft.setTextColor(ILI9341_YELLOW, ILI9341_DARKGREEN);
-      tft.printf("CONF: %.1f%% | %s",
-                 recRes.confidence * 100.0f,
-                 recRes.alreadyCheckedIn ? "ALREADY CHECKED IN" : "ATTENDANCE RECORDED");
-    } else if (recRes.state == REC_STATE_ENROLLING) {
-      tft.fillRect(0, 0, 320, 24, ILI9341_NAVY);
-      tft.setTextColor(ILI9341_CYAN, ILI9341_NAVY);
-      tft.setTextSize(1);
-      tft.setCursor(6, 4);
-      if (recRes.targetSamples > 0) {
-        tft.printf(" [ENROLLING %d/%d] %s ", recRes.sampleIndex, recRes.targetSamples, recRes.fullName.c_str());
-      } else {
-        tft.printf(" [ENROLLING] %s ", recRes.fullName.c_str());
+    // Camera Guidance Evaluation & Audio Feedback Dispatcher
+    GuidanceResult guidance = CameraGuidance::evaluate(
+      downsampleBuf ? downsampleBuf : frame->buf, 160, 120, results
+    );
+    feedbackManager.handleCameraGuidance(guidance, isUploading, hasFullScreenResult);
+
+    static RecognitionState lastDisplayedState = REC_STATE_IDLE;
+    static unsigned long lastDisplayedTimestamp = 0;
+
+    if (hasFullScreenResult) {
+      // If we haven't drawn this specific result yet, draw the full-screen card ONCE!
+      if (lastDisplayedState != recRes.state || lastDisplayedTimestamp != recRes.resultTimestamp) {
+        lastDisplayedState = recRes.state;
+        lastDisplayedTimestamp = recRes.resultTimestamp;
+
+        switch (recRes.state) {
+          case REC_STATE_MATCH:      drawFullScreenMatch(recRes); break;
+          case REC_STATE_UNKNOWN:    drawFullScreenUnknown(recRes); break;
+          case REC_STATE_AMBIGUOUS:  drawFullScreenAmbiguous(recRes); break;
+          case REC_STATE_ERROR:      drawFullScreenError(recRes); break;
+          case REC_STATE_ENROLLING:  drawFullScreenEnrolling(recRes); break;
+          case REC_STATE_ENROLLED:   drawFullScreenEnrolled(recRes); break;
+          default: break;
+        }
       }
-      tft.setCursor(6, 15);
-      tft.setTextColor(ILI9341_WHITE, ILI9341_NAVY);
-      tft.print("HOLD STILL / TURN SLIGHTLY FOR NEXT SAMPLE");
-    } else if (recRes.state == REC_STATE_ENROLLED) {
-      tft.fillRect(0, 0, 320, 24, ILI9341_DARKGREEN);
-      tft.setTextColor(ILI9341_WHITE, ILI9341_DARKGREEN);
-      tft.setTextSize(1);
-      tft.setCursor(6, 4);
-      tft.printf(" [ENROLLMENT COMPLETE] %s ", recRes.fullName.c_str());
-      tft.setCursor(6, 15);
-      tft.setTextColor(ILI9341_YELLOW, ILI9341_DARKGREEN);
-      tft.printf("STUDENT ID: %s | TEMPLATES COMMITTED", recRes.studentId.c_str());
-    } else if (recRes.state == REC_STATE_UNKNOWN) {
-      tft.fillRect(0, 0, 320, 20, ILI9341_MAROON);
-      tft.setTextColor(ILI9341_WHITE, ILI9341_MAROON);
-      tft.setTextSize(1);
-      tft.setCursor(6, 6);
-      tft.print(" UNKNOWN PERSON - ATTENDANCE NOT MARKED ");
-    } else if (recRes.state == REC_STATE_AMBIGUOUS) {
-      tft.fillRect(0, 0, 320, 20, ILI9341_ORANGE);
-      tft.setTextColor(ILI9341_BLACK, ILI9341_ORANGE);
-      tft.setTextSize(1);
-      tft.setCursor(6, 6);
-      tft.print(" AMBIGUOUS MATCH - PLEASE LOOK DIRECTLY AT CAMERA ");
-    } else if (recRes.state == REC_STATE_ERROR) {
-      tft.fillRect(0, 0, 320, 20, ILI9341_MAGENTA);
-      tft.setTextColor(ILI9341_WHITE, ILI9341_MAGENTA);
-      tft.setTextSize(1);
-      tft.setCursor(6, 6);
-      tft.printf(" SERVER ERROR: %s ", recRes.message.c_str());
+      // While full-screen card is displayed, skip rendering camera pixels to LCD (frozen & clear)
     } else {
-      // Default live tracking HUD
-      char hudBuf[36];
-      if (showCapturedNotice) {
-        snprintf(hudBuf, sizeof(hudBuf), " [IMAGE CAPTURED] %lums    ", (unsigned long)lastInferTimeMs);
-        tft.setTextColor(ILI9341_CYAN, ILI9341_BLACK);
+      // If we just exited a full-screen result card, reset state so camera preview resumes cleanly
+      if (lastDisplayedState != REC_STATE_IDLE) {
+        lastDisplayedState = REC_STATE_IDLE;
+        stableFaces.clear();
+        captureTriggered = false;
+      }
+
+      // 2. Render crisp 320x240 camera frame below HUD - 100% flicker-free & native 1:1 pixel mapping
+      tft.startWrite();
+      tft.setAddrWindow(0, HUD_HEIGHT, 320, 240 - HUD_HEIGHT);
+      for (size_t y = HUD_HEIGHT; y < 240; ++y) {
+        const uint16_t *srcRow = reinterpret_cast<const uint16_t*>(frame->buf + y * 320 * 2);
+        tft.writePixels(const_cast<uint16_t*>(srcRow), 320, true, true);
+      }
+      tft.endWrite();
+
+      // 3. Immediately draw Bounding Boxes and Landmarks from stableFaces (1-2s persistent)
+      for (const auto &res : stableFaces) {
+        // Map 160x120 model coords to 320x240 display coords (x2 scaling)
+        int bx = res.box[0] * 2;
+        int by = res.box[1] * 2;
+        int bw = (res.box[2] - res.box[0]) * 2;
+        int bh = (res.box[3] - res.box[1]) * 2;
+
+        if (bx < 0) bx = 0;
+        if (by < HUD_HEIGHT) {
+          int diff = HUD_HEIGHT - by;
+          by = HUD_HEIGHT;
+          bh -= diff;
+        }
+        if (bx + bw > 320) bw = 320 - bx;
+        if (by + bh > 240) bh = 240 - by;
+
+        if (bw > 0 && bh > 0) {
+          // Draw 2-pixel thick green bounding box
+          tft.drawRect(bx, by, bw, bh, ILI9341_GREEN);
+          if (bw > 2 && bh > 2) {
+            tft.drawRect(bx + 1, by + 1, bw - 2, bh - 2, ILI9341_GREEN);
+          }
+        }
+
+        // Draw facial landmarks if detected by MNP stage
+        if (res.keypoint.size() >= 10) {
+          for (size_t kp = 0; kp < 10; kp += 2) {
+            int kpx = res.keypoint[kp] * 2;
+            int kpy = res.keypoint[kp + 1] * 2;
+            if (kpy >= HUD_HEIGHT && kpy < 240 && kpx >= 0 && kpx < 320) {
+              tft.fillCircle(kpx, kpy, 2, ILI9341_CYAN);
+            }
+          }
+        }
+      }
+
+      // 4. Draw HUD status banner into off-screen hudCanvas (100% flicker-free)
+      hudCanvas.fillScreen(ILI9341_BLACK);
+      hudCanvas.setTextSize(1);
+      hudCanvas.setCursor(4, 6);
+
+      if (isUploading) {
+        hudCanvas.setTextColor(ILI9341_CYAN);
+        hudCanvas.print(" [PROCESSING] IDENTIFYING WITH ARCFACE... ");
+      } else if (guidance.status != GUIDANCE_OK && guidance.status != GUIDANCE_NONE) {
+        hudCanvas.setTextColor(guidance.status == GUIDANCE_NO_FACE ? ILI9341_YELLOW : ILI9341_ORANGE);
+        hudCanvas.printf(" %s", guidance.shortNotice);
+      } else if (showCapturedNotice) {
+        hudCanvas.setTextColor(ILI9341_CYAN);
+        hudCanvas.printf(" [IMAGE CAPTURED] %lums", (unsigned long)lastInferTimeMs);
       } else if (hasActiveFace) {
-        snprintf(hudBuf, sizeof(hudBuf), " FACE DETECTED (%d) %lums ", (int)stableFaces.size(), (unsigned long)lastInferTimeMs);
-        tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+        hudCanvas.setTextColor(ILI9341_GREEN);
+        hudCanvas.printf(" FACE READY (%d) %lums", (int)stableFaces.size(), (unsigned long)lastInferTimeMs);
       } else {
-        snprintf(hudBuf, sizeof(hudBuf), " NO FACE %lums            ", (unsigned long)lastInferTimeMs);
-        tft.setTextColor(ILI9341_YELLOW, ILI9341_BLACK);
+        hudCanvas.setTextColor(ILI9341_YELLOW);
+        hudCanvas.printf(" NO FACE %lums", (unsigned long)lastInferTimeMs);
       }
-      tft.setTextSize(1);
-      tft.setCursor(4, 4);
-      tft.print(hudBuf);
-    }
 
-    // Top-right Wi-Fi connection indicator
-    tft.setTextSize(1);
-    if (recognitionClient.isWiFiConnected()) {
-      tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
-      tft.setCursor(264, 4);
-      tft.print("[WIFI OK]");
-    } else {
-      tft.setTextColor(ILI9341_RED, ILI9341_BLACK);
-      tft.setCursor(256, 4);
-      tft.print("[WIFI OFF]");
+      // Top-right Wi-Fi connection indicator
+      if (recognitionClient.isWiFiConnected()) {
+        hudCanvas.setTextColor(ILI9341_GREEN);
+        hudCanvas.setCursor(256, 6);
+        hudCanvas.print("[WIFI OK]");
+      } else {
+        hudCanvas.setTextColor(ILI9341_RED);
+        hudCanvas.setCursor(250, 6);
+        hudCanvas.print("[WIFI OFF]");
+      }
+
+      // Blit the entire 320x20 HUD canvas to TFT in a single burst!
+      tft.drawRGBBitmap(0, 0, hudCanvas.getBuffer(), 320, HUD_HEIGHT);
     }
 
     totalFramesRendered++;

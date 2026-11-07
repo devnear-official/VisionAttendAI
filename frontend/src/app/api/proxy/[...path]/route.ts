@@ -30,7 +30,7 @@ const ALLOWED_ROUTES: RouteRule[] = [
   // Edge camera devices & telemetry
   { pattern: /^v1\/devices$/, methods: ["GET", "POST"] },
   { pattern: /^v1\/devices\/heartbeat$/, methods: ["POST"] },
-  { pattern: /^v1\/devices\/[a-zA-Z0-9_-]+(\/rotate-key)?$/, methods: ["GET", "POST", "PATCH", "DELETE"] },
+  { pattern: /^v1\/devices\/[a-zA-Z0-9_-]+(\/(rotate-key|speaker|speak))?$/, methods: ["GET", "POST", "PATCH", "DELETE"] },
 ];
 
 async function proxyHandler(

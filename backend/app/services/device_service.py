@@ -14,7 +14,11 @@ from app.utils.logger import logger
 
 
 class DeviceService:
-    """Manages edge camera devices, telemetry heartbeats, and cryptographic credentials."""
+    """Manages edge camera devices, telemetry heartbeats, cryptographic credentials, and audio output."""
+
+    # In-memory speaker state and audio queues
+    _speaker_states: dict[str, bool] = {}  # device_code -> enabled
+    _pending_pcm: dict[str, bytes] = {}     # device_code -> raw PCM bytes
 
     @staticmethod
     def generate_api_key() -> str:
@@ -161,3 +165,29 @@ class DeviceService:
             .all()
         )
         return list(devices), total
+
+    @classmethod
+    def get_speaker_state(cls, device_code: str) -> bool:
+        return cls._speaker_states.get(device_code, True)
+
+    @classmethod
+    def set_speaker_state(cls, device_code: str, enabled: bool) -> bool:
+        cls._speaker_states[device_code] = enabled
+        logger.info(f"Speaker state for {device_code} set to: {'ENABLED' if enabled else 'MUTED'}")
+        return enabled
+
+    @classmethod
+    def has_pending_audio(cls, device_code: str) -> bool:
+        pcm = cls._pending_pcm.get(device_code)
+        return bool(pcm and len(pcm) > 0)
+
+    @classmethod
+    def queue_pcm(cls, device_code: str, pcm_data: bytes) -> int:
+        cls._pending_pcm[device_code] = pcm_data
+        logger.info(f"Queued {len(pcm_data)} bytes of audio for {device_code}")
+        return len(pcm_data)
+
+    @classmethod
+    def pop_pending_audio(cls, device_code: str) -> Optional[bytes]:
+        pcm = cls._pending_pcm.pop(device_code, None)
+        return pcm

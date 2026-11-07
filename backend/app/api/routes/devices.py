@@ -2,7 +2,7 @@
 
 import uuid
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.orm import Session
 
 from app.core.security import verify_admin_key, verify_admin_or_device_key, verify_device_key
@@ -15,8 +15,11 @@ from app.schemas.device import (
     DeviceRegistrationResponse,
     DeviceResponse,
     DeviceUpdate,
+    DeviceSpeakerUpdate,
+    DeviceSpeakRequest,
 )
 from app.services.device_service import DeviceService
+from app.services.tts_service import TTSService
 
 router = APIRouter(prefix="/devices", tags=["Edge Devices"])
 
@@ -34,9 +37,14 @@ async def list_devices(
     _authorized: bool = Depends(verify_admin_key),
 ):
     devices, total = DeviceService.list_devices(db, skip=skip, limit=limit)
+    res_list = []
+    for d in devices:
+        res = DeviceResponse.model_validate(d)
+        res.speaker_enabled = DeviceService.get_speaker_state(d.device_code)
+        res_list.append(res)
     return DeviceListResponse(
         total=total,
-        devices=[DeviceResponse.model_validate(d) for d in devices],
+        devices=res_list,
     )
 
 
@@ -147,6 +155,77 @@ async def delete_device(
 
 
 @router.post(
+    "/{device_id}/speaker",
+    response_model=SuccessResponse,
+    summary="Toggle edge device speaker on/off",
+)
+async def toggle_device_speaker(
+    device_id: uuid.UUID,
+    payload: DeviceSpeakerUpdate,
+    db: Session = Depends(get_db),
+    _authorized: bool = Depends(verify_admin_key),
+):
+    device = DeviceService.get_by_id(db, device_id)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Device '{device_id}' not found.",
+        )
+    enabled = DeviceService.set_speaker_state(device.device_code, payload.enabled)
+    return SuccessResponse(
+        status="success",
+        message=f"Speaker output {'enabled' if enabled else 'muted'} for device {device.device_code}.",
+        data={"speaker_enabled": enabled},
+    )
+
+
+@router.post(
+    "/{device_id}/speak",
+    response_model=SuccessResponse,
+    summary="Synthesize and broadcast voice announcement on edge speaker",
+)
+async def speak_on_device(
+    device_id: uuid.UUID,
+    payload: DeviceSpeakRequest,
+    db: Session = Depends(get_db),
+    _authorized: bool = Depends(verify_admin_key),
+):
+    device = DeviceService.get_by_id(db, device_id)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Device '{device_id}' not found.",
+        )
+
+    pcm = TTSService.synthesize_pcm(payload.text)
+    DeviceService.queue_pcm(device.device_code, pcm)
+
+    return SuccessResponse(
+        status="success",
+        message=f"Voice announcement queued ({len(pcm)} bytes) for {device.device_code}.",
+        data={"text": payload.text, "bytes": len(pcm)},
+    )
+
+
+@router.get(
+    "/{device_code}/audio",
+    summary="Stream queued PCM audio to edge device",
+)
+async def get_device_audio(
+    device_code: str,
+    db: Session = Depends(get_db),
+    _authorized: bool = Depends(verify_admin_or_device_key),
+):
+    pcm = DeviceService.pop_pending_audio(device_code)
+    if not pcm:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No pending audio found for this device.",
+        )
+    return Response(content=pcm, media_type="application/octet-stream")
+
+
+@router.post(
     "/heartbeat",
     response_model=SuccessResponse,
     summary="Edge device telemetry heartbeat",
@@ -163,4 +242,8 @@ async def device_heartbeat(
     return SuccessResponse(
         status="success",
         message="Telemetry heartbeat recorded.",
+        data={
+            "speaker_enabled": DeviceService.get_speaker_state(device_code),
+            "has_pending_audio": DeviceService.has_pending_audio(device_code),
+        },
     )

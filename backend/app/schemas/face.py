@@ -67,6 +67,7 @@ class RecognitionResponse(BaseModel):
     attendance_id: Optional[str] = None
     inference_time_ms: float
     message: str
+    has_speech_audio: bool = False
 
 
 class EnrollmentSessionCreate(BaseModel):
