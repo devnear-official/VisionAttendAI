@@ -17,7 +17,7 @@ private:
     volatile bool m_isPlaying = false;
     volatile bool m_abortCurrent = false;
     bool m_enabled = true;
-    uint8_t m_volume = 85; // 0 - 100%
+    uint8_t m_volume = 95; // 0 - 100%
     bool m_initialized = false;
 
     static void audioTask(void *param) {
